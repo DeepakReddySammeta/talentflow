@@ -1,0 +1,70 @@
+/* @tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background-color: #f7faf8;
+  color: #16241d;
+}
+
+::selection {
+  background-color: #e3f5ec;
+  color: #0f5c3e;
+} */
+ /* fission Design system */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-brand:        #f25011;
+    --color-brand-hover:  #e0470f;
+    --color-brand-active: #cf400d;
+    --color-on-brand:     #ffffff;
+
+    --background:         #fafafa;
+    --foreground:         #18181b;
+    --card:               #ffffff;
+    --card-foreground:    #18181b;
+    --primary:            var(--color-brand);
+    --primary-foreground: var(--color-on-brand);
+    --secondary:          #f4f4f5;
+    --secondary-foreground: #18181b;
+    --muted:              #f4f4f5;
+    --muted-foreground:   #71717a;
+    --border:             #e4e4e7;
+    --input:              #e4e4e7;
+    --ring:               var(--color-brand);
+    --destructive:        #dc2626;
+    --destructive-foreground: #ffffff;
+    --success:            #16a34a;
+    --success-foreground: #ffffff;
+    --warning:            #d97706;
+    --warning-foreground: #ffffff;
+    --popover:            #ffffff;
+    --popover-foreground: #18181b;
+    --accent:             #f4f4f5;
+    --accent-foreground:  #18181b;
+    --sidebar-background: #1c1e2e;
+    --sidebar-foreground: #ffffff;
+    --radius:             0.5rem;
+  }
+
+  .dark {
+    --background:   #09090b;
+    --foreground:   #f4f4f5;
+    --card:         #18181b;
+    --card-foreground: #f4f4f5;
+    --popover:      #18181b;
+    --popover-foreground: #f4f4f5;
+    --accent:       #27272a;
+    --accent-foreground: #fafafa;
+    --secondary:    #27272a;
+    --secondary-foreground: #fafafa;
+    --muted:        #27272a;
+    --muted-foreground: #a1a1aa;
+    --border:       #3f3f46;
+    --input:        #3f3f46;
+  }
+}

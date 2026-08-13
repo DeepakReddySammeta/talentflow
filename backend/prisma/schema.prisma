@@ -1,0 +1,391 @@
+// Prisma schema for TalentFlow
+// Run `npx prisma migrate dev` after setting DATABASE_URL in .env
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  HR
+  MANAGER
+  INTERVIEWER
+}
+
+enum JobStatus {
+  OPEN
+  CLOSED
+  ON_HOLD
+  DRAFT
+  ARCHIVED
+}
+
+enum CandidateStatus {
+  APPLIED
+  IN_PROCESS
+  OFFERED
+  HIRED
+  REJECTED
+}
+
+enum InterviewStatus {
+  SCHEDULED
+  CLEARED
+  REJECTED
+  NO_SHOW
+}
+
+enum OfferStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  DECLINED
+}
+
+enum Recommendation {
+  STRONG_HIRE
+  HIRE
+  NO_HIRE
+  STRONG_NO_HIRE
+}
+
+enum PendingActionStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  EXPIRED
+}
+
+enum ImportJobStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum ImportRowStatus {
+  IMPORTED
+  FAILED
+}
+
+enum SkillCategory {
+  TECHNICAL
+  HUMAN
+  MANAGEMENT
+  DOMAIN
+}
+
+enum SkillProficiency {
+  BEGINNER
+  INTERMEDIATE
+  ADVANCED
+  EXPERT
+}
+
+enum ReferenceSource {
+  LINKEDIN
+  INTERNAL
+  REFERRAL
+  JOB_BOARD
+  OTHER
+}
+
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+  FREELANCE
+  INTERNSHIP
+}
+
+enum JobLevel {
+  INTERN
+  JUNIOR
+  MID
+  SENIOR
+  LEAD
+  MANAGER
+  DIRECTOR
+}
+
+enum PayCurrency {
+  INR
+  USD
+}
+
+enum PayType {
+  ANNUAL
+  MONTHLY
+  HOURLY
+}
+
+// ---- Conversation memory (Level 1-3 chat history) ----
+model Conversation {
+  id        String    @id @default(uuid())
+  user      User      @relation(fields: [userId], references: [id])
+  userId    String
+  title     String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  messages Message[]
+}
+
+model Message {
+  id             String       @id @default(uuid())
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+  conversationId String
+  role           String       // "user" | "agent"
+  content        String       // plain-language text (summary or prompt)
+  a2uiPayload    Json?        // validated A2UI surface JSON, if the agent rendered UI
+  toolTrace      Json?        // [{tool, args, resultCount}] for this turn, for debugging/audit
+  createdAt      DateTime     @default(now())
+}
+
+// ---- Level 3: propose -> confirm actions ----
+model PendingAction {
+  id          String              @id @default(uuid())
+  user        User                @relation(fields: [userId], references: [id])
+  userId      String
+  tool        String
+  args        Json
+  description String
+  status      PendingActionStatus @default(PENDING)
+  createdAt   DateTime            @default(now())
+  expiresAt   DateTime
+}
+
+// ---- Free CSV/Excel candidate import, with per-row error tracking ----
+model ImportJob {
+  id           String          @id @default(uuid())
+  uploadedBy   User            @relation(fields: [uploadedById], references: [id])
+  uploadedById String
+  fileName     String
+  type         String          @default("candidates")
+  status       ImportJobStatus @default(PROCESSING)
+  totalRows    Int             @default(0)
+  successCount Int             @default(0)
+  failureCount Int             @default(0)
+  createdAt    DateTime        @default(now())
+
+  rows ImportRow[]
+}
+
+model ImportRow {
+  id          String          @id @default(uuid())
+  job         ImportJob       @relation(fields: [jobId], references: [id])
+  jobId       String
+  rowNumber   Int
+  rawData     Json
+  status      ImportRowStatus
+  errorReason String?
+  candidateId String?
+}
+
+model User {
+  id         String    @id @default(uuid())
+  name       String
+  email      String    @unique
+  password   String
+  role       Role
+  roles      Role[]    @default([])
+  department String?
+  archivedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  jobsCreated       Job[]             @relation("JobCreatedBy")
+  interviewsGiven   Interview[]       @relation("InterviewerInterviews")
+  offersApproved    Offer[]           @relation("OfferApprovedBy")
+  notifications     Notification[]
+  conversations     Conversation[]
+  pendingActions    PendingAction[]
+  importJobs        ImportJob[]
+  unavailableSlots  InterviewerSlot[]
+  jobReviews        JobReviewer[]
+  stageAssignments  PipelineStage[]   @relation("StageInterviewer")
+}
+
+model Skill {
+  id          String        @id @default(uuid())
+  name        String        @unique
+  category    SkillCategory
+  description String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  jobs       JobSkill[]
+  candidates CandidateSkill[]
+}
+
+model Job {
+  id              String           @id @default(uuid())
+  title           String
+  department      String
+  status          JobStatus        @default(OPEN)
+  description     String?
+  referenceId     String?
+  referenceSource ReferenceSource?
+  employmentType  EmploymentType?
+  jobCode         String?
+  jobLevel        JobLevel?
+  payMin          Decimal?
+  payMax          Decimal?
+  payCurrency     PayCurrency?     @default(INR)
+  payType         PayType?         @default(ANNUAL)
+  createdBy       User             @relation("JobCreatedBy", fields: [createdById], references: [id])
+  createdById     String
+  archivedAt      DateTime?
+  createdAt       DateTime         @default(now())
+
+  candidates  Candidate[]
+  interviews  Interview[]
+  offers      Offer[]
+  stages      PipelineStage[]
+  skills      JobSkill[]
+  reviewers   JobReviewer[]
+}
+
+model JobSkill {
+  id          String           @id @default(uuid())
+  job         Job              @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId       String
+  skill       Skill            @relation(fields: [skillId], references: [id])
+  skillId     String
+  proficiency SkillProficiency @default(INTERMEDIATE)
+
+  @@unique([jobId, skillId])
+}
+
+model JobReviewer {
+  id     String @id @default(uuid())
+  job    Job    @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId  String
+  user   User   @relation(fields: [userId], references: [id])
+  userId String
+
+  @@unique([jobId, userId])
+}
+
+model PipelineStage {
+  id            String   @id @default(uuid())
+  job           Job      @relation(fields: [jobId], references: [id])
+  jobId         String
+  order         Int
+  name          String
+  kras          String[]
+  interviewerId String?
+  interviewer   User?    @relation("StageInterviewer", fields: [interviewerId], references: [id])
+
+  interviews Interview[]
+
+  @@unique([jobId, order])
+}
+
+model Candidate {
+  id           String          @id @default(uuid())
+  name         String
+  email        String
+  phone        String?
+  location     String?
+  experience   Int?
+  education    Json?
+  projects     Json?
+  linkedinUrl  String?
+  portfolioUrl String?
+  resumeUrl    String?
+  job          Job             @relation(fields: [jobId], references: [id])
+  jobId        String
+  status       CandidateStatus @default(APPLIED)
+  archivedAt   DateTime?
+  createdAt    DateTime        @default(now())
+
+  interviews Interview[]
+  offer      Offer?
+  skillLinks CandidateSkill[]
+}
+
+model CandidateSkill {
+  id          String           @id @default(uuid())
+  candidate   Candidate        @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  candidateId String
+  skill       Skill            @relation(fields: [skillId], references: [id])
+  skillId     String
+  proficiency SkillProficiency @default(INTERMEDIATE)
+
+  @@unique([candidateId, skillId])
+}
+
+model Interview {
+  id            String          @id @default(uuid())
+  candidate     Candidate       @relation(fields: [candidateId], references: [id])
+  candidateId   String
+  job           Job             @relation(fields: [jobId], references: [id])
+  jobId         String
+  interviewer   User            @relation("InterviewerInterviews", fields: [interviewerId], references: [id])
+  interviewerId String
+  stage         PipelineStage?  @relation(fields: [stageId], references: [id])
+  stageId       String?
+  round         Int
+  scheduledAt   DateTime
+  status        InterviewStatus @default(SCHEDULED)
+  feedback      String?
+  archivedAt    DateTime?
+  createdAt     DateTime        @default(now())
+
+  scorecard Scorecard?
+}
+
+model Scorecard {
+  id             String         @id @default(uuid())
+  interview      Interview      @relation(fields: [interviewId], references: [id])
+  interviewId    String         @unique
+  kraRatings     Json
+  notes          String?
+  recommendation Recommendation
+  createdAt      DateTime       @default(now())
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+  message   String
+  link      String?
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+}
+
+model FeatureFlag {
+  key       String   @id
+  enabled   Boolean  @default(false)
+  updatedAt DateTime @updatedAt
+}
+
+model Offer {
+  id           String      @id @default(uuid())
+  candidate    Candidate   @relation(fields: [candidateId], references: [id])
+  candidateId  String      @unique
+  job          Job         @relation(fields: [jobId], references: [id])
+  jobId        String
+  salary       Decimal
+  status       OfferStatus @default(DRAFT)
+  approvedBy   User?       @relation("OfferApprovedBy", fields: [approvedById], references: [id])
+  approvedById String?
+  archivedAt   DateTime?
+  createdAt    DateTime    @default(now())
+}
+
+model InterviewerSlot {
+  id            String   @id @default(uuid())
+  interviewer   User     @relation(fields: [interviewerId], references: [id])
+  interviewerId String
+  date          DateTime
+  note          String?
+  createdAt     DateTime @default(now())
+
+  @@unique([interviewerId, date])
+}
