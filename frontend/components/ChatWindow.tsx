@@ -11,6 +11,7 @@ import { SearchResultRenderer } from "@/components/SearchResultRenderer";
 import { ActionForm } from "@/components/ActionForm";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   Dialog,
   DialogContent,
@@ -246,44 +247,52 @@ export function ChatWindow({ greeting }: { greeting?: string }) {
                     {entry.prompt}
                   </div>
                 </div>
-                {/* Show stored result for all past entries; show live result for
-                    the latest entry once streaming is done. */}
-                {entry.result && !isLatest && (
-                  <AgentResult result={entry.result} catalog={catalog} />
-                )}
-                {isLatest && status === "done" && result && !pendingAction && (
-                  <AgentResult result={result} catalog={catalog} />
-                )}
-                {/* Create/update/schedule proposals render inline, right here
-                    under the turn that proposed them — no modal. Archive/
-                    restore/approve/delete stay in the modal below. */}
-                {isLatest && pendingAction?.kind === "form" && (
-                  <ActionForm
-                    pendingAction={pendingAction}
-                    values={formValues}
-                    onChange={setField}
-                    onSubmit={handleConfirm}
-                    onCancel={handleCancel}
-                    submitting={confirming}
-                  />
-                )}
-                {entry.notice && !(isLatest && pendingAction) && (
-                  <div className={`flex items-center gap-1.5 text-sm ${entry.notice.ok ? "text-muted-foreground" : "text-destructive"}`}>
-                    {entry.notice.ok ? <Check size={14} /> : <X size={14} />}
-                    {entry.notice.text}
-                  </div>
-                )}
+                {/* Response column — left-aligned with room on the right, same
+                    "prompt right / response left" shape as WhatsApp/Google Chat,
+                    rather than stretching edge-to-edge. */}
+                <div className="max-w-[85%] space-y-3">
+                  {/* Show stored result for all past entries; show live result for
+                      the latest entry once streaming is done. */}
+                  {entry.result && !isLatest && (
+                    <AgentResult result={entry.result} catalog={catalog} />
+                  )}
+                  {isLatest && status === "done" && result && !pendingAction && (
+                    <AgentResult result={result} catalog={catalog} />
+                  )}
+                  {/* Create/update/schedule proposals render inline, right here
+                      under the turn that proposed them — no modal. Archive/
+                      restore/approve/delete stay in the modal below. */}
+                  {isLatest && pendingAction?.kind === "form" && (
+                    <ActionForm
+                      pendingAction={pendingAction}
+                      values={formValues}
+                      onChange={setField}
+                      onSubmit={handleConfirm}
+                      onCancel={handleCancel}
+                      submitting={confirming}
+                    />
+                  )}
+                  {entry.notice && !(isLatest && pendingAction) && (
+                    <div className={`flex items-center gap-1.5 text-sm ${entry.notice.ok ? "text-muted-foreground" : "text-destructive"}`}>
+                      {entry.notice.ok ? <Check size={14} /> : <X size={14} />}
+                      {entry.notice.text}
+                    </div>
+                  )}
+                </div>
               </div>
             );
           })}
 
           {/* Live status */}
           {isActive && (
-            <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 size={13} className="animate-spin shrink-0 text-primary" />
-              <span className="text-foreground">
-                {progress.length > 0 ? progress[progress.length - 1] : "Connecting…"}
-              </span>
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Loader2 size={13} className="animate-spin shrink-0 text-primary" />
+                <span className="text-foreground">
+                  {progress.length > 0 ? progress[progress.length - 1] : "Connecting…"}
+                </span>
+              </div>
+              <ResultSkeleton />
             </div>
           )}
 
@@ -416,6 +425,44 @@ export function ChatWindow({ greeting }: { greeting?: string }) {
   );
 }
 
+// Shared frame for a completed turn's response — one shadowed card holding
+// the summary + whatever surface rendered, with a soft entrance animation
+// so new results don't just pop in.
+const RESPONSE_CARD_CLASS =
+  "space-y-3 rounded-xl border border-border bg-card p-4 shadow-md animate-in fade-in slide-in-from-bottom-2 duration-300";
+
+function SummaryBanner({ summary }: { summary: string }) {
+  const text = summary.replace(/\*\*/g, "").replace(/^[-*]\s+/gm, "");
+  if (!text.trim()) return null;
+  return (
+    <div className="rounded-lg bg-primary/10 px-4 py-3 text-sm text-foreground">{text}</div>
+  );
+}
+
+// Loading placeholder shown while a query is in flight — a rough shimmer of
+// the summary line + a card grid, standing in for whichever pattern
+// (grid/table/accordion) ends up rendering once the turn completes.
+function ResultSkeleton() {
+  return (
+    <div className={`${RESPONSE_CARD_CLASS} max-w-[85%]`}>
+      <Skeleton className="h-4 w-3/4" />
+      <Skeleton className="h-4 w-1/2" />
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 pt-2">
+        {[0, 1, 2].map((i) => (
+          <div key={i} className="rounded-lg border border-border p-4 space-y-2">
+            <Skeleton className="h-4 w-2/3" />
+            <Skeleton className="h-3 w-1/2" />
+            <div className="flex gap-1.5 pt-1">
+              <Skeleton className="h-5 w-16 rounded-full" />
+              <Skeleton className="h-5 w-16 rounded-full" />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function AgentResult({
   result,
   catalog,
@@ -427,18 +474,24 @@ function AgentResult({
 
   if (result.surfaceModel) {
     return (
-      <SurfaceErrorBoundary fallback={fallback}>
-        <div className="space-y-2"><A2uiSurface surface={result.surfaceModel} /></div>
-      </SurfaceErrorBoundary>
+      <div className={RESPONSE_CARD_CLASS}>
+        <SummaryBanner summary={result.summary} />
+        <SurfaceErrorBoundary fallback={fallback}>
+          <div className="space-y-2"><A2uiSurface surface={result.surfaceModel} /></div>
+        </SurfaceErrorBoundary>
+      </div>
     );
   }
   if (result.a2uiMessages) {
     const model = surfaceMessagesToModel(result.a2uiMessages, catalog);
     if (model) {
       return (
-        <SurfaceErrorBoundary fallback={fallback}>
-          <div className="space-y-2"><A2uiSurface surface={model} /></div>
-        </SurfaceErrorBoundary>
+        <div className={RESPONSE_CARD_CLASS}>
+          <SummaryBanner summary={result.summary} />
+          <SurfaceErrorBoundary fallback={fallback}>
+            <div className="space-y-2"><A2uiSurface surface={model} /></div>
+          </SurfaceErrorBoundary>
+        </div>
       );
     }
   }

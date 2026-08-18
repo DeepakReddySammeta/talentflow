@@ -3,6 +3,7 @@ import { prisma } from "../lib/prisma";
 import { requireAuth } from "../middleware/auth";
 import { executeConfirmedWrite } from "../agent/tools";
 import { WRITE_TOOL_META, reconstructArgsFromForm } from "../agent/forms";
+import { clearAgentCaches } from "../agent/orchestrator";
 
 const router = Router();
 router.use(requireAuth);
@@ -50,6 +51,7 @@ router.post("/:id/confirm", async (req, res) => {
   try {
     const result = await executeConfirmedWrite(action.tool, args, req.user!);
     await prisma.pendingAction.update({ where: { id: action.id }, data: { status: "CONFIRMED" } });
+    clearAgentCaches();
     res.json({ ok: true, result });
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to execute the confirmed action." });

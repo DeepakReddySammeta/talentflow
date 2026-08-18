@@ -1,6 +1,7 @@
 "use client";
 
-import React, { createContext, useContext } from "react";
+import React, { createContext, useContext, useEffect, useRef, useState } from "react";
+import { ChevronDown, ChevronLeft, ChevronRight, MoreHorizontal } from "lucide-react";
 import { createComponentImplementation, basicCatalog } from "@a2ui/react/v0_9";
 import { Catalog, MessageProcessor, CommonSchemas } from "@a2ui/web_core/v0_9";
 import type { SurfaceModel } from "@a2ui/web_core/v0_9";
@@ -8,7 +9,7 @@ import type { ReactComponentImplementation } from "@a2ui/react/v0_9";
 import { z } from "zod3";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { SKILL_CATEGORY_COLORS, SKILL_CATEGORY_LABELS } from "@/lib/skillCategoryStyles";
+import { SKILL_CATEGORY_COLORS } from "@/lib/skillCategoryStyles";
 import {
   Table,
   TableBody,
@@ -33,6 +34,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 
 const CATALOG_ID = "https://talentflow.internal/catalog/v1";
 
@@ -86,324 +93,395 @@ function statusBadge(status: string) {
   );
 }
 
-// ── CandidateCard ─────────────────────────────────────────────────────────────
-// `skills` is now governed CandidateSkill relation entries (id/name/category),
-// not free text — rendered as category-colored chips, matching the Skills
-// Master page's own color convention.
-const CandidateSkillRefSchema = z.object({
+// ── Shared bits: action buttons + skill chips ─────────────────────────────────
+// Every list pattern below (grid / table / accordion) attaches the same
+// shape of action list to its rows — dispatched through SurfaceActionContext
+// exactly like the old standalone TFButton did, just grouped with the row it
+// belongs to instead of floating as a full-width sibling underneath it.
+const UIActionSchema = z.object({
+  label: z.string(),
+  actionName: z.string(),
+  variant: z.enum(["default", "outline", "ghost", "destructive"]).optional(),
+  payload: z.record(z.string(), z.any()).optional(),
+});
+
+const SkillChipSchema = z.object({
   id: z.string(),
   name: z.string(),
   category: z.enum(["TECHNICAL", "HUMAN", "MANAGEMENT", "DOMAIN"]),
 });
 
-const CandidateCardImpl = createComponentImplementation(
+type UIAction = z.infer<typeof UIActionSchema>;
+
+// A single "⋯" trigger per row/card that opens the allowed actions for that
+// item — replaces what used to be a row of always-visible buttons.
+function ActionsMenu({
+  actions,
+  dispatch,
+  componentId,
+  keyPrefix,
+  compact,
+}: {
+  actions?: UIAction[];
+  dispatch: SurfaceActionDispatch;
+  componentId: string;
+  keyPrefix: string;
+  compact?: boolean;
+}) {
+  if (!actions || actions.length === 0) return null;
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <UiButton
+          variant="ghost"
+          size="icon"
+          className={compact ? "h-5 w-5 shrink-0 -mr-1" : "h-8 w-8 shrink-0"}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <MoreHorizontal className={compact ? "h-3 w-3" : "h-4 w-4"} />
+        </UiButton>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        {actions.map((a) => (
+          <DropdownMenuItem
+            key={`${keyPrefix}_${a.actionName}`}
+            className={a.variant === "destructive" ? "text-destructive focus:text-destructive" : undefined}
+            onClick={() =>
+              dispatch({
+                name: a.actionName,
+                surfaceId: "main",
+                sourceComponentId: componentId,
+                timestamp: new Date().toISOString(),
+                context: a.payload ?? {},
+              })
+            }
+          >
+            {a.label}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+function SkillChips({ skills }: { skills?: z.infer<typeof SkillChipSchema>[] }) {
+  if (!skills || skills.length === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-1">
+      {skills.map((s) => (
+        <span
+          key={s.id}
+          className={`text-xs px-2 py-0.5 rounded-full ${SKILL_CATEGORY_COLORS[s.category as keyof typeof SKILL_CATEGORY_COLORS]}`}
+        >
+          {s.name}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+// ── EntityGrid — Jobs & Candidates: 3-up card grid, infinite scroll ──────────
+// Loads GRID_BATCH more cards from the already-fetched `items` array each
+// time the sentinel at the bottom comes into view — no extra network round
+// trip, since search tools already cap what's fetched server-side.
+const GRID_BATCH = 9;
+
+const EntityGridItemSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  subtitle: z.string().optional(),
+  status: z.string().optional(),
+  badges: z.array(z.string()).optional(),
+  skills: z.array(SkillChipSchema).optional(),
+  actions: z.array(UIActionSchema).optional(),
+});
+
+const EntityGridImpl = createComponentImplementation(
   {
-    name: "CandidateCard",
+    name: "EntityGrid",
     schema: z.object({
-      candidateId: z.string(),
-      name: z.string(),
-      jobTitle: z.string().optional(),
-      skills: z.array(CandidateSkillRefSchema).optional(),
-      status: z.string().optional(),
-      location: z.string().optional(),
-      experience: z.number().optional(),
+      entityLabel: z.string(),
+      items: z.array(EntityGridItemSchema),
       filterStatus: dynamicString().optional(),
       filterSkill: dynamicString().optional(),
       filterName: dynamicString().optional(),
     }),
   },
-  ({ props }) => {
-    const filter = props.filterStatus as string | undefined;
+  ({ props, context }) => {
+    const dispatch = useContext(SurfaceActionContext);
+    const [visibleCount, setVisibleCount] = useState(GRID_BATCH);
+    const sentinelRef = useRef<HTMLDivElement | null>(null);
+
+    const filterStatus = props.filterStatus as string | undefined;
     const filterSkill = props.filterSkill as string | undefined;
     const filterName = props.filterName as string | undefined;
-    if (filter && filter !== "ALL" && filter !== props.status) return null;
-    if (filterSkill && filterSkill !== "ALL" && !(props.skills ?? []).some((s) => s.name === filterSkill)) return null;
-    if (filterName && !props.name.toLowerCase().includes(filterName.toLowerCase())) return null;
+
+    const items = (props.items ?? []).filter((it) => {
+      if (filterStatus && filterStatus !== "ALL" && filterStatus !== it.status) return false;
+      if (filterSkill && filterSkill !== "ALL" && !(it.skills ?? []).some((s) => s.name === filterSkill)) return false;
+      if (filterName && !it.title.toLowerCase().includes(filterName.toLowerCase())) return false;
+      return true;
+    });
+
+    useEffect(() => {
+      const el = sentinelRef.current;
+      if (!el) return;
+      const observer = new IntersectionObserver(
+        (entries) => {
+          if (entries[0]?.isIntersecting) {
+            setVisibleCount((c) => Math.min(c + GRID_BATCH, items.length));
+          }
+        },
+        { rootMargin: "200px" }
+      );
+      observer.observe(el);
+      return () => observer.disconnect();
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [items.length]);
+
+    if (items.length === 0) {
+      return <p className="text-sm text-muted-foreground py-6 text-center">No {props.entityLabel.toLowerCase()} found.</p>;
+    }
+
+    const visible = items.slice(0, visibleCount);
 
     return (
-      <Card>
-        <CardContent className="pt-4 pb-3 space-y-2">
-          <div className="flex items-start justify-between gap-2">
-            <div className="min-w-0">
-              <p className="font-medium text-foreground truncate">{props.name}</p>
-              <div className="flex items-center gap-2 flex-wrap mt-0.5">
-                {props.jobTitle && <p className="text-xs text-muted-foreground">{props.jobTitle}</p>}
-                {props.location && (
-                  <span className="text-xs text-muted-foreground before:content-['·'] before:mr-2">{props.location}</span>
+      <div className="space-y-3">
+        <p className="text-xs text-muted-foreground">{items.length} {props.entityLabel.toLowerCase()}</p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {visible.map((item) => (
+            <Card key={item.id}>
+              <CardContent className="pt-4 pb-3 space-y-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="font-medium text-foreground truncate">{item.title}</p>
+                    {item.subtitle && <p className="text-xs text-muted-foreground mt-0.5">{item.subtitle}</p>}
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    {item.status && statusBadge(item.status)}
+                    <ActionsMenu
+                      actions={item.actions}
+                      dispatch={dispatch}
+                      componentId={context.componentModel.id}
+                      keyPrefix={item.id}
+                    />
+                  </div>
+                </div>
+                {item.badges && item.badges.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {item.badges.map((b, i) => (
+                      <Badge key={i} variant="outline" className="text-xs">{b}</Badge>
+                    ))}
+                  </div>
                 )}
-                {props.experience != null && (
-                  <span className="text-xs text-muted-foreground before:content-['·'] before:mr-2">{props.experience} yr{props.experience !== 1 ? "s" : ""}</span>
-                )}
-              </div>
-            </div>
-            {props.status && statusBadge(props.status)}
-          </div>
-          {props.skills && props.skills.length > 0 && (
-            <div className="flex flex-wrap gap-1">
-              {props.skills.map((s) => (
-                <span
-                  key={s.id}
-                  className={`text-xs px-2 py-0.5 rounded-full ${SKILL_CATEGORY_COLORS[s.category as keyof typeof SKILL_CATEGORY_COLORS]}`}
-                >
-                  {s.name}
-                </span>
-              ))}
-            </div>
-          )}
-        </CardContent>
-      </Card>
-    );
-  }
-);
-
-// ── InterviewRow ──────────────────────────────────────────────────────────────
-const InterviewRowImpl = createComponentImplementation(
-  {
-    name: "InterviewRow",
-    schema: z.object({
-      interviewId: z.string(),
-      candidateName: z.string(),
-      round: z.number(),
-      stageName: z.string().optional(),
-      scheduledAt: z.string().optional(),
-      interviewerName: z.string().optional(),
-      status: z.string(),
-      filterStatus: dynamicString().optional(),
-    }),
-  },
-  ({ props }) => {
-    const filter = props.filterStatus as string | undefined;
-    if (filter && filter !== "ALL" && filter !== props.status) return null;
-
-    return (
-      <div className="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-border bg-card text-sm">
-        <div className="flex-1 min-w-0">
-          <p className="font-medium text-foreground truncate">{props.candidateName}</p>
-          <p className="text-xs text-muted-foreground mt-0.5">
-            Round {props.round}{props.stageName ? ` · ${props.stageName}` : ""}
-            {props.interviewerName ? ` · ${props.interviewerName}` : ""}
-          </p>
+                <SkillChips skills={item.skills} />
+              </CardContent>
+            </Card>
+          ))}
         </div>
-        {props.scheduledAt && (
-          <span className="text-xs text-muted-foreground shrink-0 hidden sm:block">{props.scheduledAt}</span>
+        {visibleCount < items.length && (
+          <div ref={sentinelRef} className="py-2 text-center text-xs text-muted-foreground">
+            Loading more…
+          </div>
         )}
-        {statusBadge(props.status)}
       </div>
     );
   }
 );
 
-// ── JobCard ───────────────────────────────────────────────────────────────────
-const JOB_LEVEL_SHORT: Record<string, string> = {
-  INTERN: "Intern", JUNIOR: "Junior", MID: "Mid", SENIOR: "Senior",
-  LEAD: "Lead", MANAGER: "Manager", DIRECTOR: "Director",
-};
-const EMP_TYPE_SHORT: Record<string, string> = {
-  FULL_TIME: "Full-time", PART_TIME: "Part-time", CONTRACT: "Contract",
-  FREELANCE: "Freelance", INTERNSHIP: "Internship",
-};
+// ── EntityTable — Interviews, Offers, Users: a table with pagination ─────────
+// Paginates client-side over the already-fetched `items` array, matching the
+// look of the dedicated /interviews, /offers, /users pages elsewhere.
+const TABLE_PAGE_SIZE = 8;
 
-function formatPay(min?: number, max?: number, currency?: string) {
-  if (!min && !max) return null;
-  const sym = currency === "USD" ? "$" : "₹";
-  const fmt = (n: number) => n >= 100000 ? `${(n / 100000).toFixed(n % 100000 === 0 ? 0 : 1)}L` : `${(n / 1000).toFixed(0)}K`;
-  if (min && max) return `${sym}${fmt(min)} – ${sym}${fmt(max)}`;
-  if (min) return `From ${sym}${fmt(min)}`;
-  return `Up to ${sym}${fmt(max!)}`;
-}
+const EntityTableItemSchema = z.object({
+  id: z.string(),
+  cells: z.record(z.string(), z.string()),
+  status: z.string().optional(),
+  actions: z.array(UIActionSchema).optional(),
+});
 
-const JobCardImpl = createComponentImplementation(
+const EntityTableImpl = createComponentImplementation(
   {
-    name: "JobCard",
+    name: "EntityTable",
     schema: z.object({
-      jobId: z.string(),
-      title: z.string(),
-      department: z.string(),
-      status: z.string().optional(),
-      employmentType: z.string().optional(),
-      jobLevel: z.string().optional(),
-      payMin: z.number().optional(),
-      payMax: z.number().optional(),
-      payCurrency: z.string().optional(),
-      candidateCount: z.number().optional(),
-      skills: z.array(z.string()).optional(),
+      entityLabel: z.string(),
+      columns: z.array(z.object({ key: z.string(), header: z.string() })),
+      items: z.array(EntityTableItemSchema),
       filterStatus: dynamicString().optional(),
-      filterSkill: dynamicString().optional(),
     }),
   },
-  ({ props }) => {
-    const filter = props.filterStatus as string | undefined;
-    const filterSkill = props.filterSkill as string | undefined;
-    if (filter && filter !== "ALL" && filter !== props.status) return null;
-    if (filterSkill && filterSkill !== "ALL" && !(props.skills ?? []).includes(filterSkill)) return null;
-    const pay = formatPay(props.payMin, props.payMax, props.payCurrency);
-    return (
-      <Card>
-        <CardContent className="pt-4 pb-3 space-y-2">
-          <div className="flex items-start justify-between gap-2">
-            <div className="min-w-0">
-              <p className="font-medium text-foreground truncate">{props.title}</p>
-              <p className="text-xs text-muted-foreground mt-0.5">{props.department}</p>
-            </div>
-            {props.status && statusBadge(props.status)}
-          </div>
-          <div className="flex flex-wrap gap-1.5">
-            {props.employmentType && (
-              <Badge variant="outline" className="text-xs">{EMP_TYPE_SHORT[props.employmentType] ?? props.employmentType}</Badge>
-            )}
-            {props.jobLevel && (
-              <Badge variant="outline" className="text-xs">{JOB_LEVEL_SHORT[props.jobLevel] ?? props.jobLevel}</Badge>
-            )}
-            {pay && (
-              <Badge variant="outline" className="text-xs font-medium">{pay}</Badge>
-            )}
-            {props.candidateCount != null && (
-              <Badge variant="secondary" className="text-xs">{props.candidateCount} candidate{props.candidateCount !== 1 ? "s" : ""}</Badge>
-            )}
-          </div>
-        </CardContent>
-      </Card>
+  ({ props, context }) => {
+    const dispatch = useContext(SurfaceActionContext);
+    const [page, setPage] = useState(1);
+    const filterStatus = props.filterStatus as string | undefined;
+
+    const items = (props.items ?? []).filter(
+      (it) => !filterStatus || filterStatus === "ALL" || filterStatus === it.status
     );
-  }
-);
 
-// ── OfferCard ────────────────────────────────────────────────────────────────
-function formatSalary(salary: number) {
-  const fmt = (n: number) => n >= 100000 ? `${(n / 100000).toFixed(n % 100000 === 0 ? 0 : 1)}L` : `${(n / 1000).toFixed(0)}K`;
-  return `₹${fmt(salary)}`;
-}
+    if (items.length === 0) {
+      return <p className="text-sm text-muted-foreground py-6 text-center">No {props.entityLabel.toLowerCase()} found.</p>;
+    }
 
-const OfferCardImpl = createComponentImplementation(
-  {
-    name: "OfferCard",
-    schema: z.object({
-      offerId: z.string(),
-      candidateName: z.string(),
-      jobTitle: z.string().optional(),
-      salary: z.number(),
-      status: z.string(),
-      filterStatus: dynamicString().optional(),
-    }),
-  },
-  ({ props }) => {
-    const filter = props.filterStatus as string | undefined;
-    if (filter && filter !== "ALL" && filter !== props.status) return null;
+    const totalPages = Math.max(1, Math.ceil(items.length / TABLE_PAGE_SIZE));
+    const safePage = Math.min(page, totalPages);
+    const start = (safePage - 1) * TABLE_PAGE_SIZE;
+    const pageItems = items.slice(start, start + TABLE_PAGE_SIZE);
+    const hasStatus = items.some((it) => it.status);
+    const hasActions = items.some((it) => it.actions && it.actions.length > 0);
+
     return (
-      <Card>
-        <CardContent className="pt-4 pb-3 space-y-2">
-          <div className="flex items-start justify-between gap-2">
-            <div className="min-w-0">
-              <p className="font-medium text-foreground truncate">{props.candidateName}</p>
-              {props.jobTitle && <p className="text-xs text-muted-foreground mt-0.5">{props.jobTitle}</p>}
-            </div>
-            {statusBadge(props.status)}
-          </div>
-          <Badge variant="outline" className="text-xs font-medium">{formatSalary(props.salary)}</Badge>
-        </CardContent>
-      </Card>
-    );
-  }
-);
-
-// ── SkillCard ────────────────────────────────────────────────────────────────
-const SkillCardImpl = createComponentImplementation(
-  {
-    name: "SkillCard",
-    schema: z.object({
-      skillId: z.string(),
-      name: z.string(),
-      category: z.string(),
-      description: z.string().optional(),
-      filterStatus: dynamicString().optional(),
-    }),
-  },
-  ({ props }) => (
-    <Card>
-      <CardContent className="pt-4 pb-3 space-y-1.5">
-        <div className="flex items-start justify-between gap-2">
-          <p className="font-medium text-foreground truncate">{props.name}</p>
-          <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${SKILL_CATEGORY_COLORS[props.category as keyof typeof SKILL_CATEGORY_COLORS] ?? ""}`}>
-            {SKILL_CATEGORY_LABELS[props.category as keyof typeof SKILL_CATEGORY_LABELS] ?? props.category}
-          </span>
-        </div>
-        {props.description && <p className="text-xs text-muted-foreground">{props.description}</p>}
-      </CardContent>
-    </Card>
-  )
-);
-
-// ── UserCard ─────────────────────────────────────────────────────────────────
-const ROLE_LABEL: Record<string, string> = {
-  ADMIN: "Admin", HR: "HR", MANAGER: "Manager", INTERVIEWER: "Interviewer",
-};
-
-const UserCardImpl = createComponentImplementation(
-  {
-    name: "UserCard",
-    schema: z.object({
-      userId: z.string(),
-      name: z.string(),
-      email: z.string(),
-      role: z.string(),
-      department: z.string().optional(),
-      filterStatus: dynamicString().optional(),
-    }),
-  },
-  ({ props }) => (
-    <Card>
-      <CardContent className="pt-4 pb-3 space-y-2">
-        <div className="flex items-start justify-between gap-2">
-          <div className="min-w-0">
-            <p className="font-medium text-foreground truncate">{props.name}</p>
-            <p className="text-xs text-muted-foreground mt-0.5">{props.email}</p>
-          </div>
-          <Badge variant="secondary" className="text-xs shrink-0">{ROLE_LABEL[props.role] ?? props.role}</Badge>
-        </div>
-        {props.department && (
-          <Badge variant="outline" className="text-xs">{props.department}</Badge>
-        )}
-      </CardContent>
-    </Card>
-  )
-);
-
-// ── Table ─────────────────────────────────────────────────────────────────────
-const TableImpl = createComponentImplementation(
-  {
-    name: "Table",
-    schema: z.object({
-      title: z.string().optional(),
-      columns: z.array(z.string()),
-      rows: z.array(z.record(z.string(), z.union([z.string(), z.number()]))),
-    }),
-  },
-  ({ props }) => (
-    <div className="space-y-2">
-      {props.title && (
-        <p className="text-sm font-medium text-foreground">{props.title}</p>
-      )}
-      <div className="rounded-lg border border-border overflow-hidden">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              {props.columns.map((col: string) => (
-                <TableHead key={col}>{col}</TableHead>
-              ))}
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {props.rows.map((row: Record<string, string | number>, i: number) => (
-              <TableRow key={i}>
-                {props.columns.map((col: string) => (
-                  <TableCell key={col}>{row[col] ?? ""}</TableCell>
+      <div className="space-y-2">
+        <p className="text-xs text-muted-foreground">{items.length} {props.entityLabel.toLowerCase()}</p>
+        <div className="rounded-lg border border-border overflow-hidden">
+          <Table>
+            <TableHeader>
+              <TableRow className="bg-muted/40 hover:bg-muted/40">
+                {props.columns.map((col) => (
+                  <TableHead key={col.key}>{col.header}</TableHead>
                 ))}
+                {hasStatus && <TableHead>Status</TableHead>}
+                {hasActions && <TableHead className="w-1" />}
               </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+            </TableHeader>
+            <TableBody>
+              {pageItems.map((row) => (
+                <TableRow key={row.id}>
+                  {props.columns.map((col) => (
+                    <TableCell key={col.key}>{row.cells[col.key] ?? ""}</TableCell>
+                  ))}
+                  {hasStatus && <TableCell>{row.status ? statusBadge(row.status) : null}</TableCell>}
+                  {hasActions && (
+                    <TableCell>
+                      <ActionsMenu
+                        actions={row.actions}
+                        dispatch={dispatch}
+                        componentId={context.componentModel.id}
+                        keyPrefix={row.id}
+                      />
+                    </TableCell>
+                  )}
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+        <div className="flex items-center justify-between px-1 py-1 text-xs text-muted-foreground">
+          <span>Showing {start + 1}–{Math.min(start + TABLE_PAGE_SIZE, items.length)} of {items.length}</span>
+          <div className="flex items-center gap-1">
+            <UiButton
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7"
+              disabled={safePage <= 1}
+              onClick={() => setPage(safePage - 1)}
+            >
+              <ChevronLeft className="h-3.5 w-3.5" />
+            </UiButton>
+            <span className="px-1">{safePage} / {totalPages}</span>
+            <UiButton
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7"
+              disabled={safePage >= totalPages}
+              onClick={() => setPage(safePage + 1)}
+            >
+              <ChevronRight className="h-3.5 w-3.5" />
+            </UiButton>
+          </div>
+        </div>
       </div>
-    </div>
-  )
+    );
+  }
+);
+
+// ── EntityAccordion — Skills: grouped by category, collapsible ───────────────
+const EntityAccordionItemSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  subtitle: z.string().optional(),
+  actions: z.array(UIActionSchema).optional(),
+});
+
+const EntityAccordionGroupSchema = z.object({
+  key: z.string(),
+  label: z.string(),
+  items: z.array(EntityAccordionItemSchema),
+});
+
+const EntityAccordionImpl = createComponentImplementation(
+  {
+    name: "EntityAccordion",
+    schema: z.object({
+      entityLabel: z.string(),
+      groups: z.array(EntityAccordionGroupSchema),
+    }),
+  },
+  ({ props, context }) => {
+    const dispatch = useContext(SurfaceActionContext);
+    const groups = props.groups ?? [];
+    const [expanded, setExpanded] = useState<Set<string>>(() => new Set(groups[0] ? [groups[0].key] : []));
+
+    if (groups.length === 0) {
+      return <p className="text-sm text-muted-foreground py-6 text-center">No {props.entityLabel.toLowerCase()} found.</p>;
+    }
+
+    function toggle(key: string) {
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        if (next.has(key)) next.delete(key);
+        else next.add(key);
+        return next;
+      });
+    }
+
+    return (
+      <div className="space-y-2">
+        {groups.map((group) => {
+          const isOpen = expanded.has(group.key);
+          return (
+            <div key={group.key} className="rounded-lg border border-border overflow-hidden">
+              <button
+                type="button"
+                onClick={() => toggle(group.key)}
+                className="w-full flex items-center justify-between px-4 py-2.5 bg-muted/30 hover:bg-muted/50 transition-colors text-sm font-medium text-foreground"
+              >
+                <span>
+                  {group.label} <span className="text-muted-foreground font-normal">({group.items.length})</span>
+                </span>
+                {isOpen ? (
+                  <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0" />
+                ) : (
+                  <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0" />
+                )}
+              </button>
+              {isOpen && (
+                <div className="flex flex-wrap gap-2 p-3">
+                  {group.items.map((item) => (
+                    <div
+                      key={item.id}
+                      title={item.subtitle ? `${item.title} — ${item.subtitle}` : item.title}
+                      className="inline-flex max-w-[220px] items-center gap-1 rounded-full border border-border bg-card py-1 pl-3 pr-1.5 text-sm"
+                    >
+                      <span className="truncate text-foreground">{item.title}</span>
+                      <ActionsMenu
+                        actions={item.actions}
+                        dispatch={dispatch}
+                        componentId={context.componentModel.id}
+                        keyPrefix={item.id}
+                        compact
+                      />
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
 );
 
 // ── Badge ─────────────────────────────────────────────────────────────────────
@@ -581,13 +659,17 @@ const ChoicePickerImpl = createComponentImplementation(
 );
 
 // ── Catalog factory ───────────────────────────────────────────────────────────
+// EntityGrid/EntityTable/EntityAccordion are generic — unlike the old
+// per-entity cards, none of them are role-gated here. Access control still
+// happens exactly where it always has: upstream, in which tools/data a role
+// can reach at all (tools.ts) and which actions the orchestrator attaches to
+// each row (orchestrator.ts) — mirrors backend/src/agent/catalog.ts.
 const baseComponents: ReactComponentImplementation[] = [
   ColumnImpl,
   TFRowImpl,
-  CandidateCardImpl,
-  InterviewRowImpl,
-  JobCardImpl,
-  TableImpl,
+  EntityGridImpl,
+  EntityTableImpl,
+  EntityAccordionImpl,
   BadgeImpl,
   ButtonImpl,
   ChoicePickerImpl,
@@ -596,19 +678,7 @@ const baseComponents: ReactComponentImplementation[] = [
 const basicComponents = Array.from(basicCatalog.components.values());
 
 export function buildCatalog(role: string): Catalog<ReactComponentImplementation> {
-  // OfferCard carries salary — withheld from Interviewer same as
-  // ConfirmDialog, mirroring backend/src/agent/catalog.ts's getCatalogForRole.
-  const tfComponents =
-    role === "INTERVIEWER"
-      ? baseComponents
-      : [...baseComponents, ConfirmDialogImpl, OfferCardImpl];
-
-  // SkillCard/UserCard are ADMIN-only, matching getCatalogForRole on the
-  // backend — other roles' search_skills results fall back to a plain
-  // Badge, and non-Admins never get UserCard data at all (search_users
-  // isn't offered to them).
-  if (role === "ADMIN") tfComponents.push(SkillCardImpl, UserCardImpl);
-
+  const tfComponents = role === "INTERVIEWER" ? baseComponents : [...baseComponents, ConfirmDialogImpl];
   return new Catalog(CATALOG_ID, [...basicComponents, ...tfComponents]);
 }
 

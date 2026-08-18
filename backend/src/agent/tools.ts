@@ -214,12 +214,17 @@ export function getToolDefinitionsForRole(role: Role) {
         name: "create_job",
         description:
           "Propose creating a new job opening. Does not execute immediately — requires explicit " +
-          "user confirmation. A default single 'Screening' pipeline stage is created if none is given.",
+          "user confirmation. A default single 'Screening' pipeline stage is created if none is given. " +
+          "Call this immediately with whatever fields the request already specifies — do not ask the " +
+          "user clarifying questions for title, department, or any other field first. Any field you " +
+          "omit is shown to the user as an editable, pre-filled field (with a sensible default for " +
+          "status/employment type/currency) in a confirmation form before anything is written, so it's " +
+          "fine to leave gaps for the user to fill in there instead of asking now.",
         parametersJsonSchema: {
           type: "object",
           properties: {
-            title: { type: "string" },
-            department: { type: "string" },
+            title: { type: ["string", "null"] },
+            department: { type: ["string", "null"] },
             status: { type: ["string", "null"], enum: JOB_STATUS_ENUM },
             description: { type: ["string", "null"] },
             employmentType: { type: ["string", "null"], enum: EMPLOYMENT_TYPE_ENUM },
@@ -239,7 +244,6 @@ export function getToolDefinitionsForRole(role: Role) {
               description: "Pipeline stages in order; defaults to a single 'Screening' stage if omitted",
             },
           },
-          required: ["title", "department"],
         },
       },
       {
@@ -1101,7 +1105,7 @@ export async function executeTool(name: string, args: any, caller: JwtPayload) {
           archivedAt: args.status === "archived" ? { not: null } : null,
         },
         include: { _count: { select: { candidates: true } }, skills: { include: { skill: true } } },
-        take: 20,
+        take: 30,
       });
 
     case "search_candidates":
@@ -1130,7 +1134,7 @@ export async function executeTool(name: string, args: any, caller: JwtPayload) {
         orderBy: ["experience", "name", "createdAt"].includes(args.sortBy)
           ? { [args.sortBy]: args.sortOrder === "desc" ? "desc" : "asc" }
           : undefined,
-        take: 20,
+        take: 30,
       });
 
     case "search_interviews":
@@ -1146,7 +1150,7 @@ export async function executeTool(name: string, args: any, caller: JwtPayload) {
           interviewerId: caller.role === "INTERVIEWER" ? caller.userId : undefined,
         },
         include: { candidate: true, job: true, interviewer: { select: { name: true } }, stage: { select: { name: true } }, scorecard: { select: { id: true } } },
-        take: 30,
+        take: 35,
       });
 
     case "get_candidate_profile":
@@ -1175,7 +1179,7 @@ export async function executeTool(name: string, args: any, caller: JwtPayload) {
               : undefined,
         },
         include: { candidate: true, job: true },
-        take: 20,
+        take: 30,
       });
 
     case "search_skills":
@@ -1185,7 +1189,7 @@ export async function executeTool(name: string, args: any, caller: JwtPayload) {
           name: args.search ? { contains: args.search, mode: "insensitive" } : undefined,
         },
         orderBy: [{ category: "asc" }, { name: "asc" }],
-        take: 50,
+        take: 150,
       });
 
     case "search_users":
@@ -1211,5 +1215,100 @@ export async function executeTool(name: string, args: any, caller: JwtPayload) {
 
     default:
       throw new Error(`Unknown tool: ${name}`);
+  }
+}
+
+/**
+ * The UI needs full Prisma records (nested job/candidate/skill objects) to
+ * render result cards, but feeding that same nesting back to the LLM as a
+ * tool result blows through small-provider token budgets fast — a page of
+ * jobs with full descriptions and denormalized skill objects easily runs
+ * several thousand tokens. This trims each read tool's result down to the
+ * handful of fields the model actually needs to answer/summarize with,
+ * right before it goes into the next completion request. The full,
+ * untrimmed result (used for the UI surface and the API response's `data`)
+ * is untouched — this only affects what the model sees.
+ */
+export function summarizeToolResultForModel(name: string, result: any): any {
+  if (result == null || (typeof result === "object" && "error" in result)) return result;
+
+  const job = (j: any) => ({
+    id: j.id,
+    title: j.title,
+    department: j.department,
+    status: j.status,
+    employmentType: j.employmentType,
+    jobLevel: j.jobLevel,
+    candidateCount: j._count?.candidates,
+    skills: (j.skills ?? []).map((s: any) => s.skill?.name).filter(Boolean),
+    archivedAt: j.archivedAt,
+  });
+
+  const candidate = (c: any) => ({
+    id: c.id,
+    name: c.name,
+    status: c.status,
+    experience: c.experience,
+    location: c.location,
+    jobTitle: c.job?.title,
+    skills: (c.skillLinks ?? []).map((s: any) => s.skill?.name).filter(Boolean),
+    archivedAt: c.archivedAt,
+  });
+
+  const interview = (iv: any) => ({
+    id: iv.id,
+    round: iv.round,
+    status: iv.status,
+    scheduledAt: iv.scheduledAt,
+    candidateName: iv.candidate?.name,
+    jobTitle: iv.job?.title,
+    interviewerName: iv.interviewer?.name,
+    stageName: iv.stage?.name,
+    hasScorecard: !!iv.scorecard,
+    archivedAt: iv.archivedAt,
+  });
+
+  const offer = (o: any) => ({
+    id: o.id,
+    status: o.status,
+    salary: o.salary,
+    candidateName: o.candidate?.name,
+    jobTitle: o.job?.title,
+    archivedAt: o.archivedAt,
+  });
+
+  // search_skills returns every column (including description, createdAt,
+  // updatedAt) — with 100+ skills in the master list that's easily the
+  // single largest read result the model ever sees, so it gets the same
+  // name/category-only trim as everything else above.
+  const skill = (s: any) => ({
+    id: s.id,
+    name: s.name,
+    category: s.category,
+  });
+
+  switch (name) {
+    case "search_jobs":
+      return Array.isArray(result) ? result.map(job) : result;
+    case "search_candidates":
+      return Array.isArray(result) ? result.map(candidate) : result;
+    case "search_interviews":
+      return Array.isArray(result) ? result.map(interview) : result;
+    case "search_offers":
+      return Array.isArray(result) ? result.map(offer) : result;
+    case "search_skills":
+      return Array.isArray(result) ? result.map(skill) : result;
+    case "get_candidate_profile":
+      return {
+        ...candidate(result),
+        interviews: (result.interviews ?? []).map((iv: any) => ({
+          id: iv.id,
+          round: iv.round,
+          status: iv.status,
+          scheduledAt: iv.scheduledAt,
+        })),
+      };
+    default:
+      return result;
   }
 }

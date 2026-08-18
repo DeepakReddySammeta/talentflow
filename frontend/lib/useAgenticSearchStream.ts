@@ -27,7 +27,7 @@ export type StreamStatus = "idle" | "connecting" | "streaming" | "done" | "error
 export interface PendingActionFormField {
   key: string;
   label: string;
-  type: "text" | "textarea" | "number" | "select" | "datetime" | "password" | "stageList";
+  type: "text" | "textarea" | "number" | "select" | "datetime" | "password" | "stageList" | "skillPicker";
   value: string | number;
   options?: { label: string; value: string }[];
   required?: boolean;

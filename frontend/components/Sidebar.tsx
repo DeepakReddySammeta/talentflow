@@ -82,7 +82,7 @@ export function Sidebar() {
     <aside
       onMouseEnter={() => collapsed && setHovered(true)}
       onMouseLeave={() => setHovered(false)}
-      className={`shrink-0 border-r border-border bg-sidebar min-h-screen flex flex-col
+      className={`shrink-0 border-r border-border bg-sidebar h-full flex flex-col
         transition-all duration-200 ease-in-out relative z-20
         ${showLabels ? "w-60" : "w-[68px]"}`}
     >
@@ -114,7 +114,7 @@ export function Sidebar() {
       </div>
 
       {/* Nav */}
-      <nav className="flex-1 px-3 py-4 space-y-1 overflow-hidden">
+      <nav className="flex-1 px-3 py-4 space-y-1 overflow-y-auto overflow-x-hidden">
         {visibleItems.map((item) => {
           const active = pathname === item.href;
           const Icon = item.icon;

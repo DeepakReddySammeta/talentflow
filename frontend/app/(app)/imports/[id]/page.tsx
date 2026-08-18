@@ -1,6 +1,5 @@
 "use client";
 
-import { use } from "react";
 import { Breadcrumb } from "@/components/Breadcrumb";
 import { DataTable, ColumnDef } from "@/components/DataTable";
 import { Badge } from "@/components/ui/badge";
@@ -8,8 +7,8 @@ import { Card, CardContent } from "@/components/ui/card";
 import { useImportJobDetail } from "@/lib/hooks";
 import { ImportRowResult } from "@/lib/types";
 
-export default function ImportDetailPage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = use(params);
+export default function ImportDetailPage({ params }: { params: { id: string } }) {
+  const { id } = params;
   const { data: job, isLoading } = useImportJobDetail(id);
 
   if (isLoading) {
