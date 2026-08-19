@@ -6,6 +6,7 @@ import { Loader2, Send, Plus, Square, Mic, MicOff, Check, X } from "lucide-react
 import { A2uiSurface } from "@a2ui/react/v0_9";
 import { useAuth } from "@/lib/authContext";
 import { useAgenticSearchStream, type StreamedResult } from "@/lib/useAgenticSearchStream";
+import { useAgenticSearchStreamAGUI } from "@/lib/useAgenticSearchStreamAGUI";
 import { buildCatalog, surfaceMessagesToModel, SurfaceActionContext, type SurfaceActionEnvelope } from "@/lib/a2uiCatalog";
 import { SearchResultRenderer } from "@/components/SearchResultRenderer";
 import { ActionForm } from "@/components/ActionForm";
@@ -86,11 +87,14 @@ interface HistoryEntry {
 export function ChatWindow({ greeting }: { greeting?: string }) {
   const { user } = useAuth();
   const catalog = useMemo(() => buildCatalog(user?.role ?? "HR"), [user?.role]);
+  const [useAGUI, setUseAGUI] = useState(false);
 
+  const wsHook = useAgenticSearchStream(catalog);
+  const aguiHook = useAgenticSearchStreamAGUI(catalog);
   const {
     status, progress, result, pendingAction, error,
     send, stop, dispatchSurfaceAction, confirmAction, cancelAction, clearPendingAction, startNewConversation,
-  } = useAgenticSearchStream(catalog);
+  } = useAGUI ? aguiHook : wsHook;
 
   const [input, setInput] = useState("");
   const [history, setHistory] = useState<HistoryEntry[]>([]);
@@ -345,6 +349,19 @@ export function ChatWindow({ greeting }: { greeting?: string }) {
 
           {/* Input row */}
           <div className="flex items-center gap-2">
+            {/* AG-UI / WS toggle */}
+            <button
+              type="button"
+              onClick={() => setUseAGUI((v) => !v)}
+              title={useAGUI ? "Using AG-UI (SSE) — click to switch to WebSocket" : "Using WebSocket — click to switch to AG-UI (SSE)"}
+              className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                useAGUI
+                  ? "border-violet-500 bg-violet-500/10 text-violet-600"
+                  : "border-border bg-muted text-muted-foreground hover:border-primary/40"
+              }`}
+            >
+              {useAGUI ? "AG-UI" : "WS"}
+            </button>
             {/* Voice button */}
             {SpeechRecognitionCtor && (
               <Button
