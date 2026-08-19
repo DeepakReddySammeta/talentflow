@@ -9,42 +9,87 @@ import { z } from "zod";
 
 const DynValue = z.union([z.string(), z.object({ path: z.string() })]);
 
-// Skills are governed CandidateSkill relation entries now, not free text —
-// each carries its master category so the card can render a colored chip.
-const CandidateSkillRef = z.object({
+// A single action button (Edit, Archive, View Profile, ...) attached to a
+// row/card/item. actionName is dispatched via SurfaceActionEnvelope — the
+// server routes it in websocket.ts. Shared across all three list patterns
+// below rather than each having its own copy.
+const UIActionSchema = z.object({
+  label: z.string(),
+  actionName: z.string(),
+  variant: z.enum(["default", "outline", "ghost", "destructive"]).optional(),
+  payload: z.record(z.string(), z.any()).optional(),
+});
+
+// Skills are governed CandidateSkill/JobSkill relation entries now, not
+// free text — each carries its master category so the chip can be colored.
+const SkillChipSchema = z.object({
   id: z.string(),
   name: z.string(),
   category: z.enum(["TECHNICAL", "HUMAN", "MANAGEMENT", "DOMAIN"]),
 });
 
-const CandidateCardProps = z.object({
-  candidateId: z.string(),
-  name: z.string(),
-  jobTitle: z.string().optional(),
-  skills: z.array(CandidateSkillRef).optional(),
+// ── EntityGrid — Jobs & Candidates: a card grid, 3-up, revealing more as
+// the viewer scrolls (infinite scroll over the already-fetched item list —
+// search tools already cap results server-side, so there's no further
+// backend round trip needed to "load more").
+const EntityGridItemSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  subtitle: z.string().optional(),
   status: z.string().optional(),
-  location: z.string().optional(),
-  experience: z.number().optional(),
+  badges: z.array(z.string()).optional(),
+  skills: z.array(SkillChipSchema).optional(),
+  actions: z.array(UIActionSchema).optional(),
+});
+
+const EntityGridProps = z.object({
+  entityLabel: z.string(),
+  items: z.array(EntityGridItemSchema),
   filterStatus: DynValue.optional(),
   filterSkill: DynValue.optional(),
   filterName: DynValue.optional(),
 });
 
-const InterviewRowProps = z.object({
-  interviewId: z.string(),
-  candidateName: z.string(),
-  round: z.number(),
-  stageName: z.string().optional(),
-  scheduledAt: z.string().optional(),
-  interviewerName: z.string().optional(),
-  status: z.string(),
+// ── EntityTable — Interviews, Offers, Users: a proper table with a
+// pagination footer, matching the look of the dedicated /interviews,
+// /offers, /users pages elsewhere in the app.
+const EntityTableColumnSchema = z.object({
+  key: z.string(),
+  header: z.string(),
+});
+
+const EntityTableItemSchema = z.object({
+  id: z.string(),
+  cells: z.record(z.string(), z.string()),
+  status: z.string().optional(),
+  actions: z.array(UIActionSchema).optional(),
+});
+
+const EntityTableProps = z.object({
+  entityLabel: z.string(),
+  columns: z.array(EntityTableColumnSchema),
+  items: z.array(EntityTableItemSchema),
   filterStatus: DynValue.optional(),
 });
 
-const TableProps = z.object({
-  title: z.string().optional(),
-  columns: z.array(z.string()),
-  rows: z.array(z.record(z.string(), z.union([z.string(), z.number()]))),
+// ── EntityAccordion — Skills: grouped by category into collapsible
+// sections, which is how the Skills Master page already thinks about them.
+const EntityAccordionItemSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  subtitle: z.string().optional(),
+  actions: z.array(UIActionSchema).optional(),
+});
+
+const EntityAccordionGroupSchema = z.object({
+  key: z.string(),
+  label: z.string(),
+  items: z.array(EntityAccordionItemSchema),
+});
+
+const EntityAccordionProps = z.object({
+  entityLabel: z.string(),
+  groups: z.array(EntityAccordionGroupSchema),
 });
 
 const BadgeProps = z.object({
@@ -63,56 +108,6 @@ const ConfirmDialogProps = z.object({
   confirmAction: z.string(),
   cancelAction: z.string(),
   payload: z.record(z.string(), z.any()).optional(),
-});
-
-const JobCardProps = z.object({
-  jobId: z.string(),
-  title: z.string(),
-  department: z.string(),
-  status: z.string().optional(),
-  employmentType: z.string().optional(),
-  jobLevel: z.string().optional(),
-  payMin: z.number().optional(),
-  payMax: z.number().optional(),
-  payCurrency: z.string().optional(),
-  candidateCount: z.number().optional(),
-  skills: z.array(z.string()).optional(),
-  filterStatus: DynValue.optional(),
-  filterSkill: DynValue.optional(),
-});
-
-// Never registered for INTERVIEWER role — salary data, mirrors the
-// search_offers tool and GET /offers route both excluding that role.
-const OfferCardProps = z.object({
-  offerId: z.string(),
-  candidateName: z.string(),
-  jobTitle: z.string().optional(),
-  salary: z.number(),
-  status: z.string(),
-  filterStatus: DynValue.optional(),
-});
-
-// ADMIN-only, mirrors the Skill master mutation RBAC (GET /skills is open
-// to everyone, but this card's Edit/Delete buttons are ADMIN-gated in
-// orchestrator.ts, and the component itself is ADMIN-only in the catalog
-// since the tools that let an agent surface it meaningfully are ADMIN-only).
-const SkillCardProps = z.object({
-  skillId: z.string(),
-  name: z.string(),
-  category: z.string(),
-  description: z.string().optional(),
-  filterStatus: DynValue.optional(),
-});
-
-// ADMIN-only — everything about Users is (mirrors users.routes.ts's
-// router-level allowRoles("ADMIN")).
-const UserCardProps = z.object({
-  userId: z.string(),
-  name: z.string(),
-  email: z.string(),
-  role: z.string(),
-  department: z.string().optional(),
-  filterStatus: DynValue.optional(),
 });
 
 // TFRow is a horizontal layout wrapper (renamed from "Row" to avoid shadowing
@@ -156,13 +151,9 @@ const TextFieldProps = z.object({
 
 // The registry: component type name -> its prop schema.
 export const A2UI_CATALOG = {
-  CandidateCard: CandidateCardProps,
-  InterviewRow: InterviewRowProps,
-  JobCard: JobCardProps,
-  OfferCard: OfferCardProps,
-  SkillCard: SkillCardProps,
-  UserCard: UserCardProps,
-  Table: TableProps,
+  EntityGrid: EntityGridProps,
+  EntityTable: EntityTableProps,
+  EntityAccordion: EntityAccordionProps,
   Badge: BadgeProps,
   ConfirmDialog: ConfirmDialogProps,
   TFRow: TFRowProps,
@@ -175,28 +166,22 @@ export const A2UI_CATALOG = {
 export type A2UIComponentType = keyof typeof A2UI_CATALOG;
 
 /**
- * Role-scoped catalog subset — mirrors the tool-scoping pattern in tools.ts.
- * An Interviewer's agent session is never offered ConfirmDialog (write action
- * confirmation) regardless of what the model tries to emit.
+ * Role-scoped catalog subset. Unlike the old per-entity cards (JobCard,
+ * OfferCard, SkillCard, ...), EntityGrid/EntityTable/EntityAccordion are
+ * generic renderers — they carry no opinion about which role should see
+ * them. The actual access control happens upstream, same as it always
+ * has: a role only ever gets salary-bearing Offer rows, User rows, or
+ * skill Edit/Delete actions in the first place if its tools/orchestrator
+ * logic decided to hand them over (see tools.ts and orchestrator.ts).
+ * ConfirmDialog remains the one component withheld outright, since an
+ * Interviewer has no write tools that would ever propose one.
  */
 export function getCatalogForRole(role: string): A2UIComponentType[] {
   const base: A2UIComponentType[] = [
-    "CandidateCard", "InterviewRow", "JobCard", "Table",
+    "EntityGrid", "EntityTable", "EntityAccordion",
     "Badge", "TFRow", "TFColumn", "ChoicePicker", "TFButton", "TextField",
   ];
-  if (role !== "INTERVIEWER") {
-    // Offers carry salary — same exclusion as the search_offers tool and
-    // GET /offers route. ConfirmDialog is also withheld from Interviewer
-    // since they have no write tools that would ever propose one.
-    base.push("ConfirmDialog", "OfferCard");
-  }
-  if (role === "ADMIN") {
-    // search_skills is open to every role, but only ADMIN gets the rich
-    // card with Edit/Delete affordances — other roles' skill results fall
-    // through to a plain Badge, which is a fine degradation for read-only
-    // reference data.
-    base.push("SkillCard", "UserCard");
-  }
+  if (role !== "INTERVIEWER") base.push("ConfirmDialog");
   return base;
 }
 

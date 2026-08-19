@@ -26,6 +26,7 @@ import {
   useInterviews, useCreateInterview, useRescheduleInterview, useSubmitScorecard,
   useCandidates, useUsers, useJobs, useArchiveInterview, useRestoreInterview,
 } from "@/lib/hooks";
+import { RecommendationCell, ScorecardDetailDialog } from "@/components/ScorecardFeedback";
 import { Interview, Recommendation } from "@/lib/types";
 
 const STATUS_OPTIONS = [
@@ -40,13 +41,6 @@ const STATUS_VARIANT: Record<string, "default" | "secondary" | "success" | "warn
   CLEARED: "success",
   REJECTED: "destructive",
   NO_SHOW: "warning",
-};
-
-const RECOMMENDATION_COLOR: Record<string, string> = {
-  STRONG_HIRE:    "text-green-600",
-  HIRE:           "text-green-500",
-  NO_HIRE:        "text-orange-500",
-  STRONG_NO_HIRE: "text-destructive",
 };
 
 const RECOMMENDATIONS: Recommendation[] = ["STRONG_HIRE", "HIRE", "NO_HIRE", "STRONG_NO_HIRE"];
@@ -350,6 +344,7 @@ export default function InterviewsPage() {
   const [scheduleOpen, setScheduleOpen] = useState(false);
   const [scorecardTarget, setScorecardTarget] = useState<Interview | null>(null);
   const [rescheduleTarget, setRescheduleTarget] = useState<Interview | null>(null);
+  const [viewingScorecard, setViewingScorecard] = useState<Interview | null>(null);
 
   const { data, isLoading } = useInterviews({
     page, limit,
@@ -414,15 +409,7 @@ export default function InterviewsPage() {
     {
       key: "scorecard",
       header: "Recommendation",
-      render: (i) => {
-        const rec = i.scorecard?.recommendation;
-        if (!rec) return <span className="text-xs text-muted-foreground italic">Pending</span>;
-        return (
-          <span className={`text-sm font-medium ${RECOMMENDATION_COLOR[rec] ?? ""}`}>
-            {rec.replace(/_/g, " ")}
-          </span>
-        );
-      },
+      render: (i) => <RecommendationCell interview={i} onView={setViewingScorecard} />,
     },
     {
       key: "actions",
@@ -532,6 +519,11 @@ export default function InterviewsPage() {
         interview={rescheduleTarget}
         open={!!rescheduleTarget}
         onClose={() => setRescheduleTarget(null)}
+      />
+      <ScorecardDetailDialog
+        interview={viewingScorecard}
+        open={!!viewingScorecard}
+        onClose={() => setViewingScorecard(null)}
       />
     </div>
   );

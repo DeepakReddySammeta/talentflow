@@ -1,23 +1,23 @@
-import Groq from "groq-sdk";
-import { createCompletion, SYSTEM_INSTRUCTION } from "./llm";
-import { getToolDefinitionsForRole, executeTool, WRITE_TOOLS, describeProposedAction } from "./tools";
+import { createCompletion, SYSTEM_INSTRUCTION, ChatMessage } from "./llm";
+import { getToolDefinitionsForRole, executeTool, WRITE_TOOLS, describeProposedAction, summarizeToolResultForModel } from "./tools";
 import { buildFormFields, WRITE_TOOL_META } from "./forms";
 import { JwtPayload } from "../types";
 import { prisma } from "../lib/prisma";
-import { getCatalogForRole, validateA2UISurface } from "./catalog";
+import { validateA2UISurface } from "./catalog";
+import { AgentResultCache, buildCacheKey } from "../lib/agentCache";
 
 const MAX_TOOL_ITERATIONS = 5;
 const PENDING_ACTION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const HISTORY_MESSAGE_LIMIT = 12; // ~6 prior turns — lightweight text-only replay
 
 /**
- * Turns a stored Message row back into a Groq chat turn for conversational
+ * Turns a stored Message row back into a chat turn for conversational
  * memory. Only ever replays the plain `content` text as alternating
  * user/assistant turns — never fabricates tool_calls/tool role messages,
- * since those were never persisted in Groq's native format and
+ * since those were never persisted in the LLM's native format and
  * reconstructing fake ones would be fragile.
  */
-function messageToGroqTurn(msg: { role: string; content: string; toolTrace: unknown }): Groq.Chat.ChatCompletionMessageParam {
+function messageToGroqTurn(msg: { role: string; content: string; toolTrace: unknown }): ChatMessage {
   if (msg.role === "user") return { role: "user", content: msg.content };
   // proposeWrite's message.create never sets toolTrace; the final-turn
   // create always does (even steps=[]). Use that to detect an unconfirmed
@@ -95,8 +95,8 @@ const STATUS_FILTER_OPTIONS = [
 
 type EntityKind = "job" | "candidate" | "interview" | "offer" | "skill" | "user" | null;
 
-// Reuses the same field-sniffing rules itemToComponents uses below — run
-// once per batch (on the first item), not per item.
+// Field-sniffing rules shared by buildFilterComponents (below) and
+// groupByKind (further down) — run once per batch/item as needed.
 function detectEntityKind(item: any): EntityKind {
   if (!item) return null;
   if (item.round !== undefined) return "interview";
@@ -142,10 +142,11 @@ function buildFilterComponents(items: any[]): A2uiComponent[] {
     });
   }
 
-  // Skill — Jobs and Candidates only, same "real variety" gate.
-  if (kind === "job" || kind === "candidate") {
+  // Skill — Candidates only (the grid pattern is the only one wired to
+  // consume filterSkill; Jobs render as a table now, same "real variety" gate).
+  if (kind === "candidate") {
     const skillNames = distinctValues(
-      items.flatMap((i) => (kind === "job" ? i.skills ?? [] : i.skillLinks ?? []).map((s: any) => s.skill?.name ?? s.name)),
+      items.flatMap((i) => (i.skillLinks ?? []).map((s: any) => s.skill?.name ?? s.name)),
       (n: string) => n
     );
     if (skillNames.length > 1) {
@@ -205,369 +206,355 @@ function seedFilterDefaults(components: A2uiComponent[]): A2uiMessage[] {
     .map((d) => ({ version: "v0.9" as const, updateDataModel: { surfaceId: SURFACE_ID, path: d.path, value: d.value } }));
 }
 
-// Returns [cardComponent, ...optionalButtonComponents] for an item.
-// Buttons are only emitted when TFButton is in the allowed catalog set AND
-// the caller's role matches that action's REST-route RBAC.
-function itemToComponents(item: any, allowed: Set<string>, fallbackIndex: number, role: string): A2uiComponent[] {
-  // Interview — has round field. Note: for role === "INTERVIEWER", the
-  // upstream search_interviews query already hardcodes interviewerId to
-  // the caller, so any row reaching here for that role is already theirs —
-  // no separate "is this my interview" check is needed.
-  if (item.round !== undefined && allowed.has("InterviewRow")) {
-    const card: A2uiComponent = {
-      id: `interview_${item.id}`,
-      component: "InterviewRow",
-      interviewId: item.id,
-      candidateName: item.candidate?.name ?? "Candidate",
-      round: item.round,
-      stageName: item.stage?.name,
-      scheduledAt: item.scheduledAt ? new Date(item.scheduledAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : undefined,
-      interviewerName: item.interviewer?.name,
-      status: item.status,
-      filterStatus: { path: "filter/status" },
-    };
-    if (!allowed.has("TFButton")) return [card];
+// ---------------------------------------------------------------
+// Result rendering: items are grouped by entity kind, and each kind gets
+// ONE composite list component (EntityGrid / EntityTable / EntityAccordion)
+// carrying its full item array — rather than the old one-component-per-item
+// approach, where each row's action buttons were separate root-level
+// siblings (rendering as full-width bars stacked under the card). Actions
+// now travel as data on the item itself, and the composite component lays
+// them out inline with the row they belong to.
+// ---------------------------------------------------------------
 
-    const buttons: A2uiComponent[] = [];
-    if (role === "ADMIN" || role === "HR") {
-      buttons.push({
-        id: `btn_reschedule_${item.id}`,
-        component: "TFButton",
-        label: "Reschedule",
-        actionName: "reschedule_interview",
-        variant: "outline",
-        payload: { interviewId: item.id },
-      });
-      const archived = item.archivedAt != null;
-      buttons.push({
-        id: `btn_archive_interview_${item.id}`,
-        component: "TFButton",
-        label: archived ? "Restore" : "Archive",
-        actionName: archived ? "restore_interview" : "archive_interview",
-        variant: archived ? "outline" : "destructive",
-        payload: { interviewId: item.id },
-      });
+const JOB_LEVEL_SHORT: Record<string, string> = {
+  INTERN: "Intern", JUNIOR: "Junior", MID: "Mid", SENIOR: "Senior",
+  LEAD: "Lead", MANAGER: "Manager", DIRECTOR: "Director",
+};
+const EMP_TYPE_SHORT: Record<string, string> = {
+  FULL_TIME: "Full-time", PART_TIME: "Part-time", CONTRACT: "Contract",
+  FREELANCE: "Freelance", INTERNSHIP: "Internship",
+};
+const ROLE_LABEL: Record<string, string> = {
+  ADMIN: "Admin", HR: "HR", MANAGER: "Manager", INTERVIEWER: "Interviewer",
+};
+const SKILL_CATEGORY_LABEL: Record<string, string> = {
+  TECHNICAL: "Technical", HUMAN: "Human", MANAGEMENT: "Management", DOMAIN: "Domain",
+};
+
+function formatPay(min?: number, max?: number, currency?: string): string | null {
+  if (!min && !max) return null;
+  const sym = currency === "USD" ? "$" : "₹";
+  const fmt = (n: number) => (n >= 100000 ? `${(n / 100000).toFixed(n % 100000 === 0 ? 0 : 1)}L` : `${(n / 1000).toFixed(0)}K`);
+  if (min && max) return `${sym}${fmt(min)} – ${sym}${fmt(max)}`;
+  if (min) return `From ${sym}${fmt(min)}`;
+  return `Up to ${sym}${fmt(max!)}`;
+}
+
+function formatSalary(salary: number): string {
+  const fmt = (n: number) => (n >= 100000 ? `${(n / 100000).toFixed(n % 100000 === 0 ? 0 : 1)}L` : `${(n / 1000).toFixed(0)}K`);
+  return `₹${fmt(salary)}`;
+}
+
+interface UIAction {
+  label: string;
+  actionName: string;
+  variant?: "default" | "outline" | "ghost" | "destructive";
+  payload?: Record<string, unknown>;
+}
+
+// Same RBAC every action already had as a standalone TFButton — just
+// gathered into one place instead of scattered across per-entity builders.
+function buildActions(kind: Exclude<EntityKind, null>, item: any, role: string): UIAction[] {
+  const archived = item.archivedAt != null;
+  switch (kind) {
+    case "interview": {
+      const actions: UIAction[] = [];
+      if (role === "ADMIN" || role === "HR") {
+        actions.push({ label: "Reschedule", actionName: "reschedule_interview", variant: "outline", payload: { interviewId: item.id } });
+        actions.push({
+          label: archived ? "Restore" : "Archive",
+          actionName: archived ? "restore_interview" : "archive_interview",
+          variant: archived ? "outline" : "destructive",
+          payload: { interviewId: item.id },
+        });
+      }
+      if ((role === "ADMIN" || role === "INTERVIEWER") && !item.scorecard) {
+        actions.push({ label: "Submit Scorecard", actionName: "submit_scorecard", variant: "outline", payload: { interviewId: item.id } });
+      }
+      return actions;
     }
-    if ((role === "ADMIN" || role === "INTERVIEWER") && !item.scorecard) {
-      buttons.push({
-        id: `btn_scorecard_${item.id}`,
-        component: "TFButton",
-        label: "Submit Scorecard",
-        actionName: "submit_scorecard",
-        variant: "outline",
-        payload: { interviewId: item.id },
-      });
+    case "job": {
+      if (role !== "ADMIN" && role !== "HR") return [];
+      return [
+        { label: "Edit", actionName: "edit_job", variant: "outline", payload: { jobId: item.id } },
+        {
+          label: archived ? "Restore" : "Archive",
+          actionName: archived ? "restore_job" : "archive_job",
+          variant: archived ? "outline" : "destructive",
+          payload: { jobId: item.id },
+        },
+      ];
     }
-    return [card, ...buttons];
+    case "candidate": {
+      const actions: UIAction[] = [
+        { label: "View Profile", actionName: "view_candidate", variant: "outline", payload: { candidateId: item.id } },
+      ];
+      if (role === "ADMIN" || role === "HR") {
+        actions.push({ label: "Edit", actionName: "edit_candidate", variant: "outline", payload: { candidateId: item.id } });
+        actions.push({
+          label: archived ? "Restore" : "Archive",
+          actionName: archived ? "restore_candidate" : "archive_candidate",
+          variant: archived ? "outline" : "destructive",
+          payload: { candidateId: item.id },
+        });
+      }
+      return actions;
+    }
+    case "offer": {
+      const actions: UIAction[] = [];
+      if (role === "ADMIN" || role === "HR") {
+        actions.push({ label: "Edit", actionName: "edit_offer", variant: "outline", payload: { offerId: item.id } });
+      }
+      if ((role === "ADMIN" || role === "MANAGER") && item.status === "DRAFT") {
+        actions.push({ label: "Approve", actionName: "approve_offer", variant: "default", payload: { offerId: item.id } });
+      }
+      if (role === "ADMIN" || role === "HR") {
+        actions.push({
+          label: archived ? "Restore" : "Archive",
+          actionName: archived ? "restore_offer" : "archive_offer",
+          variant: archived ? "outline" : "destructive",
+          payload: { offerId: item.id },
+        });
+      }
+      return actions;
+    }
+    case "skill": {
+      if (role !== "ADMIN") return [];
+      return [
+        { label: "Edit", actionName: "edit_skill", variant: "outline", payload: { skillId: item.id } },
+        { label: "Delete", actionName: "delete_skill", variant: "destructive", payload: { skillId: item.id } },
+      ];
+    }
+    case "user": {
+      if (role !== "ADMIN") return [];
+      return [
+        { label: "Edit", actionName: "edit_user", variant: "outline", payload: { userId: item.id } },
+        {
+          label: archived ? "Restore" : "Archive",
+          actionName: archived ? "restore_user" : "archive_user",
+          variant: archived ? "outline" : "destructive",
+          payload: { userId: item.id },
+        },
+      ];
+    }
+    default:
+      return [];
   }
-  // Job — has title + department
-  if (item.title && item.department && allowed.has("JobCard")) {
-    const card: A2uiComponent = {
-      id: `job_${item.id}`,
-      component: "JobCard",
-      jobId: item.id,
-      title: item.title,
-      department: item.department,
+}
+
+// Job/Candidate -> EntityGrid card item.
+// Candidate -> EntityGrid card item.
+function toGridItem(item: any, role: string) {
+  const actions = buildActions("candidate", item, role);
+  return {
+    id: item.id,
+    title: item.name,
+    subtitle: item.job?.title,
+    status: item.status,
+    badges: [
+      item.location ?? null,
+      item.experience != null ? `${item.experience} yr${item.experience !== 1 ? "s" : ""}` : null,
+    ].filter((b): b is string => !!b),
+    skills: (item.skillLinks ?? []).map((sl: any) => ({ id: sl.skill.id, name: sl.skill.name, category: sl.skill.category })),
+    actions,
+  };
+}
+
+const TABLE_COLUMNS: Record<"job" | "interview" | "offer" | "user", { key: string; header: string }[]> = {
+  job: [
+    { key: "title", header: "Title" },
+    { key: "department", header: "Department" },
+    { key: "employmentType", header: "Type" },
+    { key: "jobLevel", header: "Level" },
+    { key: "pay", header: "Pay" },
+    { key: "candidates", header: "Candidates" },
+  ],
+  interview: [
+    { key: "candidate", header: "Candidate" },
+    { key: "job", header: "Job" },
+    { key: "round", header: "Round" },
+    { key: "interviewer", header: "Interviewer" },
+    { key: "scheduledAt", header: "Scheduled" },
+  ],
+  offer: [
+    { key: "candidate", header: "Candidate" },
+    { key: "job", header: "Job" },
+    { key: "salary", header: "Salary" },
+  ],
+  user: [
+    { key: "name", header: "Name" },
+    { key: "email", header: "Email" },
+    { key: "role", header: "Role" },
+    { key: "department", header: "Department" },
+  ],
+};
+
+// Job/Interview/Offer/User -> EntityTable row.
+function toTableItem(kind: "job" | "interview" | "offer" | "user", item: any, role: string) {
+  const actions = buildActions(kind, item, role);
+  if (kind === "job") {
+    const pay = formatPay(item.payMin ? Number(item.payMin) : undefined, item.payMax ? Number(item.payMax) : undefined, item.payCurrency);
+    return {
+      id: item.id,
+      cells: {
+        title: item.title,
+        department: item.department,
+        employmentType: item.employmentType ? EMP_TYPE_SHORT[item.employmentType] ?? item.employmentType : "—",
+        jobLevel: item.jobLevel ? JOB_LEVEL_SHORT[item.jobLevel] ?? item.jobLevel : "—",
+        pay: pay ?? "—",
+        candidates: item._count?.candidates != null ? String(item._count.candidates) : "0",
+      },
       status: item.status,
-      employmentType: item.employmentType,
-      jobLevel: item.jobLevel,
-      payMin: item.payMin ? Number(item.payMin) : undefined,
-      payMax: item.payMax ? Number(item.payMax) : undefined,
-      payCurrency: item.payCurrency,
-      candidateCount: item._count?.candidates,
-      skills: (item.skills ?? []).map((s: any) => s.skill.name),
-      filterStatus: { path: "filter/status" },
-      filterSkill: { path: "filter/skill" },
+      actions,
     };
-    if (!allowed.has("TFButton") || (role !== "ADMIN" && role !== "HR")) return [card];
-    const editBtn: A2uiComponent = {
-      id: `btn_edit_job_${item.id}`,
-      component: "TFButton",
-      label: "Edit",
-      actionName: "edit_job",
-      variant: "outline",
-      payload: { jobId: item.id },
-    };
-    const archived = item.archivedAt != null;
-    const archiveBtn: A2uiComponent = {
-      id: `btn_archive_job_${item.id}`,
-      component: "TFButton",
-      label: archived ? "Restore" : "Archive",
-      actionName: archived ? "restore_job" : "archive_job",
-      variant: archived ? "outline" : "destructive",
-      payload: { jobId: item.id },
-    };
-    return [card, editBtn, archiveBtn];
   }
-  // Candidate — has name + skillLinks (governed skill relation, may be an
-  // empty array for a candidate with no skills, but the field is present)
-  if (item.name && item.skillLinks !== undefined && allowed.has("CandidateCard")) {
-    const card: A2uiComponent = {
-      id: `candidate_${item.id}`,
-      component: "CandidateCard",
-      candidateId: item.id,
+  if (kind === "interview") {
+    return {
+      id: item.id,
+      cells: {
+        candidate: item.candidate?.name ?? "Candidate",
+        job: item.job?.title ?? "—",
+        round: `Round ${item.round}${item.stage?.name ? ` · ${item.stage.name}` : ""}`,
+        interviewer: item.interviewer?.name ?? "—",
+        scheduledAt: item.scheduledAt
+          ? new Date(item.scheduledAt).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })
+          : "—",
+      },
+      status: item.status,
+      actions,
+    };
+  }
+  if (kind === "offer") {
+    return {
+      id: item.id,
+      cells: {
+        candidate: item.candidate?.name ?? "Candidate",
+        job: item.job?.title ?? "—",
+        salary: formatSalary(Number(item.salary)),
+      },
+      status: item.status,
+      actions,
+    };
+  }
+  return {
+    id: item.id,
+    cells: {
       name: item.name,
-      jobTitle: item.job?.title,
-      skills: (item.skillLinks ?? []).map((sl: any) => ({ id: sl.skill.id, name: sl.skill.name, category: sl.skill.category })),
-      status: item.status,
-      location: item.location,
-      experience: item.experience ?? undefined,
+      email: item.email,
+      role: ROLE_LABEL[item.role] ?? item.role,
+      department: item.department ?? "—",
+    },
+    actions,
+  };
+}
+
+// Skill -> EntityAccordion groups, grouped by category.
+function buildSkillAccordionGroups(items: any[], role: string) {
+  const byCategory = new Map<string, any[]>();
+  for (const item of items) {
+    const list = byCategory.get(item.category) ?? [];
+    list.push(item);
+    byCategory.set(item.category, list);
+  }
+  const order = ["TECHNICAL", "HUMAN", "MANAGEMENT", "DOMAIN"];
+  return order
+    .filter((cat) => byCategory.has(cat))
+    .map((cat) => ({
+      key: cat,
+      label: SKILL_CATEGORY_LABEL[cat] ?? cat,
+      items: byCategory.get(cat)!.map((s) => ({
+        id: s.id,
+        title: s.name,
+        subtitle: s.description ?? undefined,
+        actions: buildActions("skill", s, role),
+      })),
+    }));
+}
+
+const ENTITY_LABEL: Record<Exclude<EntityKind, null>, string> = {
+  job: "Jobs", candidate: "Candidates", interview: "Interviews",
+  offer: "Offers", skill: "Skills", user: "Users",
+};
+
+const ENTITY_PATTERN: Record<Exclude<EntityKind, null>, "grid" | "table" | "accordion"> = {
+  candidate: "grid",
+  job: "table", interview: "table", offer: "table", user: "table",
+  skill: "accordion",
+};
+
+function groupByKind(items: any[]): Map<Exclude<EntityKind, null>, any[]> {
+  const map = new Map<Exclude<EntityKind, null>, any[]>();
+  for (const item of items) {
+    const kind = detectEntityKind(item);
+    if (!kind) continue;
+    const list = map.get(kind) ?? [];
+    list.push(item);
+    map.set(kind, list);
+  }
+  return map;
+}
+
+// Builds the ONE composite component for a kind, given its full
+// (already-accumulated) item list. Component id is stable per kind so
+// repeated calls across a streaming tool loop just replace it in place.
+function buildCompositeComponent(kind: Exclude<EntityKind, null>, items: any[], role: string): A2uiComponent | null {
+  if (items.length === 0) return null;
+  const id = `composite_${kind}`;
+  const pattern = ENTITY_PATTERN[kind];
+
+  if (pattern === "grid") {
+    return {
+      id,
+      component: "EntityGrid",
+      entityLabel: ENTITY_LABEL[kind],
+      items: items.map((it) => toGridItem(it, role)),
       filterStatus: { path: "filter/status" },
       filterSkill: { path: "filter/skill" },
       filterName: { path: "filter/name" },
     };
-    if (!allowed.has("TFButton")) return [card];
-    const viewBtn: A2uiComponent = {
-      id: `btn_view_${item.id}`,
-      component: "TFButton",
-      label: "View Profile",
-      actionName: "view_candidate",
-      variant: "outline",
-      payload: { candidateId: item.id },
-    };
-    if (role !== "ADMIN" && role !== "HR") return [card, viewBtn];
-    const editBtn: A2uiComponent = {
-      id: `btn_edit_candidate_${item.id}`,
-      component: "TFButton",
-      label: "Edit",
-      actionName: "edit_candidate",
-      variant: "outline",
-      payload: { candidateId: item.id },
-    };
-    const archived = item.archivedAt != null;
-    const archiveBtn: A2uiComponent = {
-      id: `btn_archive_candidate_${item.id}`,
-      component: "TFButton",
-      label: archived ? "Restore" : "Archive",
-      actionName: archived ? "restore_candidate" : "archive_candidate",
-      variant: archived ? "outline" : "destructive",
-      payload: { candidateId: item.id },
-    };
-    return [card, viewBtn, editBtn, archiveBtn];
   }
-  // Offer — has salary + candidateId + jobId, none of the above shapes.
-  // Checked after Job/Candidate/Interview since it's otherwise unambiguous.
-  if (item.salary !== undefined && item.candidateId && item.jobId && allowed.has("OfferCard")) {
-    const card: A2uiComponent = {
-      id: `offer_${item.id}`,
-      component: "OfferCard",
-      offerId: item.id,
-      candidateName: item.candidate?.name ?? "Candidate",
-      jobTitle: item.job?.title,
-      salary: Number(item.salary),
-      status: item.status,
+  if (pattern === "table") {
+    return {
+      id,
+      component: "EntityTable",
+      entityLabel: ENTITY_LABEL[kind],
+      columns: TABLE_COLUMNS[kind as "job" | "interview" | "offer" | "user"],
+      items: items.map((it) => toTableItem(kind as "job" | "interview" | "offer" | "user", it, role)),
       filterStatus: { path: "filter/status" },
     };
-    if (!allowed.has("TFButton")) return [card];
-
-    const buttons: A2uiComponent[] = [];
-    if (role === "ADMIN" || role === "HR") {
-      buttons.push({
-        id: `btn_edit_offer_${item.id}`,
-        component: "TFButton",
-        label: "Edit",
-        actionName: "edit_offer",
-        variant: "outline",
-        payload: { offerId: item.id },
-      });
-    }
-    if ((role === "ADMIN" || role === "MANAGER") && item.status === "DRAFT") {
-      buttons.push({
-        id: `btn_approve_offer_${item.id}`,
-        component: "TFButton",
-        label: "Approve",
-        actionName: "approve_offer",
-        variant: "default",
-        payload: { offerId: item.id },
-      });
-    }
-    if (role === "ADMIN" || role === "HR") {
-      const archived = item.archivedAt != null;
-      buttons.push({
-        id: `btn_archive_offer_${item.id}`,
-        component: "TFButton",
-        label: archived ? "Restore" : "Archive",
-        actionName: archived ? "restore_offer" : "archive_offer",
-        variant: archived ? "outline" : "destructive",
-        payload: { offerId: item.id },
-      });
-    }
-    return [card, ...buttons];
   }
-  // Skill — has category + name, none of the shapes above (checked last
-  // among the "real" branches since it's the least distinctive: category
-  // alone is what makes it unambiguous, since Job/Candidate/Interview/Offer
-  // never carry that field).
-  if (item.category !== undefined && item.name && allowed.has("SkillCard")) {
-    const card: A2uiComponent = {
-      id: `skill_${item.id}`,
-      component: "SkillCard",
-      skillId: item.id,
-      name: item.name,
-      category: item.category,
-      description: item.description ?? undefined,
-      filterStatus: { path: "filter/status" },
-    };
-    if (!allowed.has("TFButton") || role !== "ADMIN") return [card];
-    const editBtn: A2uiComponent = {
-      id: `btn_edit_skill_${item.id}`,
-      component: "TFButton",
-      label: "Edit",
-      actionName: "edit_skill",
-      variant: "outline",
-      payload: { skillId: item.id },
-    };
-    const deleteBtn: A2uiComponent = {
-      id: `btn_delete_skill_${item.id}`,
-      component: "TFButton",
-      label: "Delete",
-      actionName: "delete_skill",
-      variant: "destructive",
-      payload: { skillId: item.id },
-    };
-    return [card, editBtn, deleteBtn];
-  }
-  // User (staff account) — has both email and a top-level role field.
-  // Candidate also has email but never role; checked last among the "real"
-  // branches so it's unambiguous regardless of order.
-  if (item.email && item.role && allowed.has("UserCard")) {
-    const card: A2uiComponent = {
-      id: `user_${item.id}`,
-      component: "UserCard",
-      userId: item.id,
-      name: item.name,
-      email: item.email,
-      role: item.role,
-      department: item.department ?? undefined,
-      filterStatus: { path: "filter/status" },
-    };
-    if (!allowed.has("TFButton") || role !== "ADMIN") return [card];
-    const editBtn: A2uiComponent = {
-      id: `btn_edit_user_${item.id}`,
-      component: "TFButton",
-      label: "Edit",
-      actionName: "edit_user",
-      variant: "outline",
-      payload: { userId: item.id },
-    };
-    const archived = item.archivedAt != null;
-    const archiveBtn: A2uiComponent = {
-      id: `btn_archive_user_${item.id}`,
-      component: "TFButton",
-      label: archived ? "Restore" : "Archive",
-      actionName: archived ? "restore_user" : "archive_user",
-      variant: archived ? "outline" : "destructive",
-      payload: { userId: item.id },
-    };
-    return [card, editBtn, archiveBtn];
-  }
-  // Fallback badge
-  return [{
-    id: `badge_${item.id ?? fallbackIndex}`,
-    component: "Badge",
-    label: item.title
-      ? item.department ? `${item.title} · ${item.department}` : item.title
-      : item.name || String(item.id ?? fallbackIndex),
-    tone: item.salary !== undefined ? "success" : "neutral",
-  }];
-}
-
-function buildPartialSurface(
-  items: any[],
-  role: string,
-  allPriorChildIds: string[],
-  isFirst: boolean,
-  showFilters: boolean
-): { messages: A2uiMessage[]; newChildIds: string[] } | null {
-  if (items.length === 0) return null;
-  const allowed = new Set(getCatalogForRole(role));
-
-  const newComponents: A2uiComponent[] = [];
-  const newChildIds: string[] = [];
-
-  for (const item of items.slice(0, 20)) {
-    const comps = itemToComponents(item, allowed, allPriorChildIds.length + newChildIds.length, role);
-    for (const comp of comps) {
-      newComponents.push(comp);
-      // Only the first component (the card) is added to the root children list;
-      // TFButton is a sibling in the layout but should also be a root child so
-      // A2uiSurface can resolve it by ID.
-      newChildIds.push(comp.id);
-    }
-  }
-
-  if (newComponents.length === 0) return null;
-
-  // The actual enforcement point: every component built from live data is
-  // checked against the role-scoped catalog + its Zod prop schema before
-  // it's allowed into an outgoing message. Anything that fails is dropped,
-  // not sent — this is what makes "the agent can never invent UI" true.
-  const { valid: validComponents, rejected } = validateA2UISurface(newComponents, role);
-  if (rejected.length > 0) {
-    console.warn("[a2ui] dropped invalid component(s) before emission:", rejected);
-  }
-  const validIds = new Set(validComponents.map((c) => c.id));
-  const validChildIds = newChildIds.filter((id) => validIds.has(id));
-
-  if (validComponents.length === 0) return null;
-
-  const filterComponents = isFirst && showFilters ? buildFilterComponents(items) : [];
-  const filterBarIds = filterComponents.map((c) => c.id);
-  const allChildIds = [...filterBarIds, ...allPriorChildIds, ...validChildIds];
-  const root: A2uiComponent = { id: "root", component: "TFColumn", children: allChildIds };
-
-  const messages: A2uiMessage[] = [];
-  if (isFirst) {
-    messages.push({
-      version: "v0.9",
-      createSurface: {
-        surfaceId: SURFACE_ID,
-        catalogId: CATALOG_ID,
-        theme: { agentDisplayName: "TalentFlow Agent", primaryColor: "#7c3aed" },
-      },
-    });
-    messages.push(...seedFilterDefaults(filterComponents));
-  }
-  messages.push({
-    version: "v0.9",
-    updateComponents: { surfaceId: SURFACE_ID, components: [root, ...filterComponents, ...validComponents] },
-  });
-
-  return { messages, newChildIds: validChildIds };
+  return {
+    id,
+    component: "EntityAccordion",
+    entityLabel: ENTITY_LABEL[kind],
+    groups: buildSkillAccordionGroups(items, role),
+  };
 }
 
 function buildA2UISurfaceMessages(data: any[], role: string, showFilters: boolean): A2uiMessage[] | null {
-  if (data.length === 0) return null;
-  const allowed = new Set(getCatalogForRole(role));
+  const byKind = groupByKind(data);
+  if (byKind.size === 0) return null;
 
-  const components: A2uiComponent[] = [];
-  const childIds: string[] = [];
+  const filterComponents = showFilters ? buildFilterComponents(data) : [];
+  const components: A2uiComponent[] = [...filterComponents];
+  const rootChildIds: string[] = filterComponents.map((c) => c.id);
 
-  for (const item of data.slice(0, 20)) {
-    const comps = itemToComponents(item, allowed, childIds.length, role);
-    for (const comp of comps) {
-      components.push(comp);
-      childIds.push(comp.id);
-    }
+  for (const [kind, items] of byKind) {
+    const comp = buildCompositeComponent(kind, items, role);
+    if (!comp) continue;
+    components.push(comp);
+    rootChildIds.push(comp.id);
   }
-
-  if (components.length === 0) return null;
 
   const { valid: validComponents, rejected } = validateA2UISurface(components, role);
   if (rejected.length > 0) {
     console.warn("[a2ui] dropped invalid component(s) before emission:", rejected);
   }
-  const validIds = new Set(validComponents.map((c) => c.id));
-  const validChildIds = childIds.filter((id) => validIds.has(id));
-
   if (validComponents.length === 0) return null;
+  const validIds = new Set(validComponents.map((c) => c.id));
+  const validRootChildIds = rootChildIds.filter((id) => validIds.has(id));
 
-  const filterComponents = showFilters ? buildFilterComponents(data) : [];
-  const root: A2uiComponent = {
-    id: "root",
-    component: "TFColumn",
-    children: [...filterComponents.map((c) => c.id), ...validChildIds],
-  };
+  const root: A2uiComponent = { id: "root", component: "TFColumn", children: validRootChildIds };
 
   return [
     {
@@ -578,8 +565,8 @@ function buildA2UISurfaceMessages(data: any[], role: string, showFilters: boolea
         theme: { agentDisplayName: "TalentFlow Agent", primaryColor: "#7c3aed" },
       },
     },
-    ...seedFilterDefaults(filterComponents),
-    { version: "v0.9", updateComponents: { surfaceId: SURFACE_ID, components: [root, ...filterComponents, ...validComponents] } },
+    ...seedFilterDefaults(filterComponents.filter((c) => validIds.has(c.id))),
+    { version: "v0.9", updateComponents: { surfaceId: SURFACE_ID, components: [root, ...validComponents] } },
   ];
 }
 
@@ -595,13 +582,34 @@ export interface AgentResult {
   data: any[];
 }
 
+interface CachedStreamingResult {
+  summary: string;
+  steps: AgentStep[];
+  data: any[];
+  a2uiMessages: A2uiMessage[] | null;
+  streamedA2ui: A2uiMessage[];
+}
+
+const plainResultCache = new AgentResultCache<AgentResult>();
+const streamingResultCache = new AgentResultCache<CachedStreamingResult>();
+
+/** Flushes both agent result caches. Call after any confirmed write — see actions.routes.ts. */
+export function clearAgentCaches(): void {
+  plainResultCache.clear();
+  streamingResultCache.clear();
+}
+
 // ---------------------------------------------------------------
 // Non-streaming path (kept for the plain POST /search route)
 // ---------------------------------------------------------------
 export async function runAgent(prompt: string, caller: JwtPayload): Promise<AgentResult> {
+  const cacheKey = buildCacheKey(caller, prompt);
+  const cached = plainResultCache.get(cacheKey);
+  if (cached) return cached;
+
   const toolDefinitions = getToolDefinitionsForRole(caller.role).filter((t) => !WRITE_TOOLS.has(t.name));
 
-  const messages: Groq.Chat.ChatCompletionMessageParam[] = [
+  const messages: ChatMessage[] = [
     { role: "system", content: SYSTEM_INSTRUCTION },
     { role: "user", content: prompt },
   ];
@@ -620,11 +628,13 @@ export async function runAgent(prompt: string, caller: JwtPayload): Promise<Agen
       const summary = allEmpty
         ? "No matching records found. Try a different search term or broaden your query."
         : cleanText(assistantMessage.content);
-      return { summary, steps, data: collectedData };
+      const result = { summary, steps, data: collectedData };
+      plainResultCache.set(cacheKey, result);
+      return result;
     }
 
     // Append the assistant turn (with tool_calls) to the history
-    messages.push(assistantMessage as Groq.Chat.ChatCompletionMessageParam);
+    messages.push(assistantMessage as ChatMessage);
 
     for (const call of toolCalls) {
       let args: any;
@@ -648,14 +658,16 @@ export async function runAgent(prompt: string, caller: JwtPayload): Promise<Agen
       messages.push({
         role: "tool",
         tool_call_id: call.id,
-        content: JSON.stringify(toPlainJSON(result)),
+        content: JSON.stringify(toPlainJSON(summarizeToolResultForModel(call.function.name, result))),
       });
     }
 
     response = await withRetry(() => createCompletion(messages, toolDefinitions));
   }
 
-  return { summary: "Reached the tool-call limit before finishing — try a narrower query.", steps, data: collectedData };
+  const result = { summary: "Reached the tool-call limit before finishing — try a narrower query.", steps, data: collectedData };
+  plainResultCache.set(cacheKey, result);
+  return result;
 }
 
 // ---------------------------------------------------------------
@@ -801,7 +813,7 @@ export async function runAgentStreaming(
 
   // Only query on a genuine follow-up turn — a brand-new conversation
   // (conversationId === null) has nothing to load, skip the round trip.
-  let history: Groq.Chat.ChatCompletionMessageParam[] = [];
+  let history: ChatMessage[] = [];
   if (conversationId) {
     const priorMessages = await prisma.message.findMany({
       where: { conversationId: conversation.id },
@@ -816,6 +828,33 @@ export async function runAgentStreaming(
     data: { conversationId: conversation.id, role: "user", content: prompt },
   });
 
+  const cacheKey = buildCacheKey(caller, prompt, dataModel);
+  const cachedResult = streamingResultCache.get(cacheKey);
+  if (cachedResult) {
+    emit({ type: "progress", message: "Using cached results..." });
+    if (cachedResult.streamedA2ui.length > 0) {
+      emit({ type: "surface_update", a2uiMessages: cachedResult.streamedA2ui });
+    }
+    await prisma.message.create({
+      data: {
+        conversationId: conversation.id,
+        role: "agent",
+        content: cachedResult.summary,
+        a2uiPayload: cachedResult.a2uiMessages ? toPlainJSON(cachedResult.a2uiMessages) : undefined,
+        toolTrace: toPlainJSON(cachedResult.steps),
+      },
+    });
+    emit({
+      type: "final",
+      conversationId: conversation.id,
+      summary: cachedResult.summary,
+      steps: cachedResult.steps,
+      data: cachedResult.data,
+      a2uiMessages: cachedResult.a2uiMessages,
+    });
+    return;
+  }
+
   emit({ type: "progress", message: "Thinking..." });
 
   const toolDefinitions = getToolDefinitionsForRole(caller.role);
@@ -824,7 +863,7 @@ export async function runAgentStreaming(
     ? `${prompt}\n\n[User's current filter state: ${JSON.stringify(dataModel)}]`
     : prompt;
 
-  const messages: Groq.Chat.ChatCompletionMessageParam[] = [
+  const messages: ChatMessage[] = [
     { role: "system", content: SYSTEM_INSTRUCTION },
     ...history,
     { role: "user", content: augmentedPrompt },
@@ -832,8 +871,15 @@ export async function runAgentStreaming(
 
   const steps: AgentStep[] = [];
   const collectedData: any[] = [];
-  let surfaceChildIds: string[] = [];
-  let surfaceStarted = false;
+  // One composite component per entity kind, accumulated across the tool
+  // loop (a multi-hop query may touch more than one kind) — see
+  // buildCompositeComponent above.
+  const itemsByKind = new Map<Exclude<EntityKind, null>, any[]>();
+  const kindsOnSurface = new Set<Exclude<EntityKind, null>>();
+  let rootChildIds: string[] = [];
+  let surfaceCreated = false;
+  let filtersEmitted = false;
+  const streamedA2ui: A2uiMessage[] = [];
 
   let response = await withRetry(() => createCompletion(messages, toolDefinitions));
 
@@ -844,7 +890,7 @@ export async function runAgentStreaming(
     if (!toolCalls || toolCalls.length === 0) break;
 
     // Append the assistant turn to history
-    messages.push(assistantMessage as Groq.Chat.ChatCompletionMessageParam);
+    messages.push(assistantMessage as ChatMessage);
 
     for (const call of toolCalls) {
       const name = call.function.name;
@@ -876,11 +922,55 @@ export async function runAgentStreaming(
       steps.push({ tool: name, args, resultCount: asArray.length });
 
       const narrowed = asArray.length <= 1 || isNarrowingCall(name, args);
-      const partial = buildPartialSurface(asArray, caller.role, surfaceChildIds, !surfaceStarted, !narrowed);
-      if (partial) {
-        surfaceChildIds = [...surfaceChildIds, ...partial.newChildIds];
-        surfaceStarted = true;
-        emit({ type: "surface_update", a2uiMessages: partial.messages });
+      const batchByKind = groupByKind(asArray);
+      if (batchByKind.size > 0) {
+        const outgoing: A2uiMessage[] = [];
+        const emitComponents: A2uiComponent[] = [];
+
+        if (!filtersEmitted && !narrowed) {
+          filtersEmitted = true;
+          const filterComponents = buildFilterComponents(asArray);
+          if (filterComponents.length > 0) {
+            rootChildIds.push(...filterComponents.map((c) => c.id));
+            emitComponents.push(...filterComponents);
+            outgoing.push(...seedFilterDefaults(filterComponents));
+          }
+        }
+
+        for (const [kind, newItems] of batchByKind) {
+          const merged = [...(itemsByKind.get(kind) ?? []), ...newItems];
+          itemsByKind.set(kind, merged);
+          const comp = buildCompositeComponent(kind, merged, caller.role);
+          if (!comp) continue;
+          emitComponents.push(comp);
+          if (!kindsOnSurface.has(kind)) {
+            kindsOnSurface.add(kind);
+            rootChildIds.push(comp.id);
+          }
+        }
+
+        const { valid: validComponents, rejected } = validateA2UISurface(emitComponents, caller.role);
+        if (rejected.length > 0) {
+          console.warn("[a2ui] dropped invalid component(s) before emission:", rejected);
+        }
+
+        if (validComponents.length > 0) {
+          if (!surfaceCreated) {
+            outgoing.unshift({
+              version: "v0.9",
+              createSurface: {
+                surfaceId: SURFACE_ID,
+                catalogId: CATALOG_ID,
+                theme: { agentDisplayName: "TalentFlow Agent", primaryColor: "#7c3aed" },
+              },
+            });
+            surfaceCreated = true;
+          }
+          const root: A2uiComponent = { id: "root", component: "TFColumn", children: rootChildIds };
+          outgoing.push({ version: "v0.9", updateComponents: { surfaceId: SURFACE_ID, components: [root, ...validComponents] } });
+          streamedA2ui.push(...outgoing);
+          emit({ type: "surface_update", a2uiMessages: outgoing });
+        }
       }
 
       emit({ type: "progress", message: `Found ${asArray.length} result${asArray.length === 1 ? "" : "s"}...` });
@@ -888,7 +978,7 @@ export async function runAgentStreaming(
       messages.push({
         role: "tool",
         tool_call_id: call.id,
-        content: JSON.stringify(toPlainJSON(result)),
+        content: JSON.stringify(toPlainJSON(summarizeToolResultForModel(name, result))),
       });
 
       response = await withRetry(() => createCompletion(messages, toolDefinitions));
@@ -904,7 +994,9 @@ export async function runAgentStreaming(
     ? "No matching records found. Try a different search term or broaden your query."
     : rawSummary || "Reached the tool-call limit before finishing — try a narrower query.";
   const overallNarrowed = collectedData.length <= 1 || steps.every((s) => isNarrowingCall(s.tool, s.args));
-  const a2uiMessages = surfaceStarted ? null : buildA2UISurfaceMessages(collectedData, caller.role, !overallNarrowed);
+  const a2uiMessages = surfaceCreated ? null : buildA2UISurfaceMessages(collectedData, caller.role, !overallNarrowed);
+
+  streamingResultCache.set(cacheKey, { summary, steps, data: collectedData, a2uiMessages, streamedA2ui });
 
   await prisma.message.create({
     data: {

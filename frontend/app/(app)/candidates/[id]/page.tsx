@@ -1,10 +1,10 @@
 "use client";
 
-import { use } from "react";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   Mail, Phone, MapPin, Briefcase, Linkedin, Globe, FileText, GraduationCap,
-  Star, Calendar,
+  Calendar,
 } from "lucide-react";
 import { Breadcrumb } from "@/components/Breadcrumb";
 import { DataTable, ColumnDef } from "@/components/DataTable";
@@ -14,6 +14,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useCandidate, useCandidateDebrief } from "@/lib/hooks";
 import { SKILL_CATEGORY_COLORS, SKILL_CATEGORY_LABELS } from "@/components/SkillPicker";
+import { RecommendationCell, ScorecardDetailDialog } from "@/components/ScorecardFeedback";
 import { Interview } from "@/lib/types";
 
 const STATUS_VARIANT: Record<string, "default" | "secondary" | "success" | "warning" | "destructive" | "outline"> = {
@@ -27,19 +28,13 @@ const STATUS_VARIANT: Record<string, "default" | "secondary" | "success" | "warn
   NO_SHOW: "warning",
 };
 
-const RECOMMENDATION_LABEL: Record<string, { label: string; color: string }> = {
-  STRONG_HIRE:    { label: "Strong Hire",    color: "text-green-600" },
-  HIRE:           { label: "Hire",           color: "text-green-500" },
-  NO_HIRE:        { label: "No Hire",        color: "text-orange-500" },
-  STRONG_NO_HIRE: { label: "Strong No Hire", color: "text-destructive" },
-};
-
-export default function CandidateDetailPage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = use(params);
+export default function CandidateDetailPage({ params }: { params: { id: string } }) {
+  const { id } = params;
   const router = useRouter();
 
   const { data: candidate, isLoading } = useCandidate(id);
   const { data: debrief } = useCandidateDebrief(id);
+  const [viewingScorecard, setViewingScorecard] = useState<Interview | null>(null);
 
   if (isLoading) return <div className="h-48 rounded-lg bg-muted animate-pulse" />;
   if (!candidate) return <div className="text-center py-20 text-muted-foreground">Candidate not found.</div>;
@@ -80,12 +75,7 @@ export default function CandidateDetailPage({ params }: { params: Promise<{ id: 
     {
       key: "recommendation",
       header: "Recommendation",
-      render: (i) => {
-        const rec = i.scorecard?.recommendation;
-        if (!rec) return <span className="text-xs text-muted-foreground italic">Pending</span>;
-        const { label, color } = RECOMMENDATION_LABEL[rec] ?? { label: rec, color: "" };
-        return <span className={`text-sm font-medium ${color}`}>{label}</span>;
-      },
+      render: (i) => <RecommendationCell interview={i} onView={setViewingScorecard} />,
     },
   ];
 
@@ -399,6 +389,12 @@ export default function CandidateDetailPage({ params }: { params: Promise<{ id: 
           )}
         </TabsContent>
       </Tabs>
+
+      <ScorecardDetailDialog
+        interview={viewingScorecard}
+        open={!!viewingScorecard}
+        onClose={() => setViewingScorecard(null)}
+      />
     </div>
   );
 }

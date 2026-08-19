@@ -18,7 +18,7 @@ import { prisma } from "../lib/prisma";
 export interface FormField {
   key: string;
   label: string;
-  type: "text" | "textarea" | "number" | "select" | "datetime" | "password" | "stageList";
+  type: "text" | "textarea" | "number" | "select" | "datetime" | "password" | "stageList" | "skillPicker";
   value: string | number;
   options?: { label: string; value: string }[];
   required?: boolean;
@@ -76,8 +76,14 @@ const JOB_FIELDS: FieldDef[] = [
   { key: "payCurrency", label: "Currency", type: "select", options: opt(["INR", "USD"]), step: JOB_STEP.GENERAL, stepTitle: "General info" },
   { key: "description", label: "Description", type: "textarea", step: JOB_STEP.DESCRIPTION, stepTitle: "Description" },
   { key: "stages", label: "Pipeline stages", type: "stageList", step: JOB_STEP.STAGES, stepTitle: "Pipeline stages" },
-  { key: "skillNames", label: "Required skills (comma-separated)", type: "text", placeholder: "React, Node.js", step: JOB_STEP.SKILLS, stepTitle: "Required skills" },
+  { key: "skillIds", label: "Required skills", type: "skillPicker", step: JOB_STEP.SKILLS, stepTitle: "Required skills" },
 ];
+
+// Applied only for create_job — enough to make "create a job for X" pop the
+// form fully filled instead of blank, without overriding anything the LLM
+// already pulled out of the prompt. update_job pre-fills from the record's
+// actual current values instead, never these.
+const CREATE_JOB_DEFAULTS = { status: "DRAFT", employmentType: "FULL_TIME", payCurrency: "INR" };
 
 const CANDIDATE_FIELDS_CREATE: FieldDef[] = [
   { key: "name", label: "Name", type: "text", required: true },
@@ -187,6 +193,7 @@ function materialize(defs: FieldDef[], values: Record<string, any>): FormField[]
     let value = values[def.key];
     if (def.type === "datetime") value = toDatetimeLocal(value);
     else if (def.type === "stageList") value = stagesToJson(value);
+    else if (def.type === "skillPicker") value = JSON.stringify(Array.isArray(value) ? value : []);
     else if (def.key === "skillNames") value = joinNames(value);
     else if (value === null || value === undefined) value = "";
     return { ...def, value };
@@ -195,6 +202,39 @@ function materialize(defs: FieldDef[], values: Record<string, any>): FormField[]
 
 const num = (v: unknown): number | undefined => (v === "" || v === undefined || v === null ? undefined : Number(v));
 const str = (v: unknown): string | undefined => (v === "" || v === undefined || v === null ? undefined : String(v));
+
+function parseSkillIds(v: unknown): string[] {
+  if (Array.isArray(v)) return v;
+  if (typeof v !== "string" || !v.trim()) return [];
+  try {
+    const parsed = JSON.parse(v);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Resolves whatever the LLM supplied (skillIds and/or free-text
+ * skillNames) into a single list of real Skill master ids, for pre-filling
+ * the skillPicker field. Only matches existing skills — unlike
+ * resolveOrCreateSkillIds, this never creates a new master skill, since
+ * that's a side effect that shouldn't happen before the user has even seen
+ * (let alone confirmed) the form. A name with no match is simply dropped;
+ * the user can add it from the picker's search themselves.
+ */
+async function resolveSkillIdsForForm(args: any): Promise<string[]> {
+  const ids = new Set<string>(Array.isArray(args.skillIds) ? args.skillIds : []);
+  const names: string[] = Array.isArray(args.skillNames) ? args.skillNames : [];
+  if (names.length) {
+    const wanted = new Set(names.map((n) => n.trim().toLowerCase()).filter(Boolean));
+    const allSkills = await prisma.skill.findMany({ select: { id: true, name: true } });
+    for (const s of allSkills) {
+      if (wanted.has(s.name.toLowerCase())) ids.add(s.id);
+    }
+  }
+  return Array.from(ids);
+}
 
 /**
  * Builds the editable field set for a proposed write action, or null for a
@@ -208,8 +248,10 @@ export async function buildFormFields(tool: string, args: any): Promise<FormFiel
   if (!meta || meta.kind !== "form") return null;
 
   switch (tool) {
-    case "create_job":
-      return materialize(JOB_FIELDS, args);
+    case "create_job": {
+      const skillIds = await resolveSkillIdsForForm(args);
+      return materialize(JOB_FIELDS, { ...CREATE_JOB_DEFAULTS, ...args, skillIds });
+    }
 
     case "update_job": {
       const job = args.jobId
@@ -219,12 +261,16 @@ export async function buildFormFields(tool: string, args: any): Promise<FormFiel
           })
         : null;
       const currentStages = job?.stages?.map((s) => ({ name: s.name, kras: s.kras })) ?? DEFAULT_STAGE;
-      const currentSkillNames = job?.skills?.map((s) => s.skill.name) ?? [];
+      const currentSkillIds = job?.skills?.map((s) => s.skillId) ?? [];
+      const skillIds =
+        args.skillIds !== undefined || args.skillNames !== undefined
+          ? await resolveSkillIdsForForm(args)
+          : currentSkillIds;
       return materialize(JOB_FIELDS, {
         ...job,
         ...args,
         stages: args.stages ?? currentStages,
-        skillNames: args.skillNames !== undefined ? args.skillNames : currentSkillNames,
+        skillIds,
       });
     }
 
@@ -355,7 +401,8 @@ export function reconstructArgsFromForm(tool: string, baseArgs: any, values: Rec
         payCurrency: str(values.payCurrency) ?? null,
         description: str(values.description) ?? null,
         stages: parseStages(values.stages),
-        skillNames: splitNames(values.skillNames),
+        skillIds: parseSkillIds(values.skillIds),
+        skillNames: undefined,
       };
 
     case "create_candidate":

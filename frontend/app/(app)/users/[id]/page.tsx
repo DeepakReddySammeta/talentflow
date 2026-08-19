@@ -1,6 +1,5 @@
 "use client";
 
-import { use } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Mail, Building2, Calendar, BarChart2 } from "lucide-react";
 import { Breadcrumb } from "@/components/Breadcrumb";
@@ -27,8 +26,8 @@ const STATUS_VARIANT: Record<string, "default" | "secondary" | "success" | "warn
   NO_SHOW: "warning",
 };
 
-export default function UserDetailPage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = use(params);
+export default function UserDetailPage({ params }: { params: { id: string } }) {
+  const { id } = params;
   const router = useRouter();
   const { data: user, isLoading } = useUser(id);
 

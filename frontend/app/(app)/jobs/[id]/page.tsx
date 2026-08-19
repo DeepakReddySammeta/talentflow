@@ -1,6 +1,6 @@
 "use client";
 
-import { use, useState } from "react";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Building2, Calendar, User, CheckCircle2 } from "lucide-react";
 import { Breadcrumb } from "@/components/Breadcrumb";
@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useJob, useJobCandidates, useJobInterviews } from "@/lib/hooks";
+import { RecommendationCell, ScorecardDetailDialog } from "@/components/ScorecardFeedback";
 import { Candidate, Interview } from "@/lib/types";
 
 const STATUS_VARIANT: Record<string, "default" | "secondary" | "success" | "warning" | "destructive" | "outline"> = {
@@ -17,14 +18,15 @@ const STATUS_VARIANT: Record<string, "default" | "secondary" | "success" | "warn
   SCHEDULED: "secondary", CLEARED: "success", NO_SHOW: "warning",
 };
 
-export default function JobDetailPage({ params }: { params: Promise<{ id: string }> }) {
-  const { id } = use(params);
+export default function JobDetailPage({ params }: { params: { id: string } }) {
+  const { id } = params;
   const router = useRouter();
   const { data: job, isLoading } = useJob(id);
   const [candidatePage, setCandidatePage] = useState(1);
   const [interviewPage, setInterviewPage] = useState(1);
   const { data: candidatesData, isLoading: candidatesLoading } = useJobCandidates(id, candidatePage);
   const { data: interviewsData, isLoading: interviewsLoading } = useJobInterviews(id, interviewPage);
+  const [viewingScorecard, setViewingScorecard] = useState<Interview | null>(null);
 
   if (isLoading) return <div className="h-48 rounded-lg bg-muted animate-pulse" />;
   if (!job) return <div className="text-center py-20 text-muted-foreground">Job not found.</div>;
@@ -44,6 +46,7 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
     { key: "interviewer", header: "Interviewer", render: (i) => <span className="text-sm text-muted-foreground">{i.interviewer?.name ?? "—"}</span> },
     { key: "scheduledAt", header: "Date", render: (i) => <span className="text-sm text-muted-foreground">{new Date(i.scheduledAt).toLocaleDateString("en-GB")}</span> },
     { key: "status", header: "Status", render: (i) => <Badge variant={STATUS_VARIANT[i.status] ?? "outline"}>{i.status}</Badge> },
+    { key: "recommendation", header: "Recommendation", render: (i) => <RecommendationCell interview={i} onView={setViewingScorecard} /> },
   ];
 
   return (
@@ -137,6 +140,12 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
           />
         </TabsContent>
       </Tabs>
+
+      <ScorecardDetailDialog
+        interview={viewingScorecard}
+        open={!!viewingScorecard}
+        onClose={() => setViewingScorecard(null)}
+      />
     </div>
   );
 }

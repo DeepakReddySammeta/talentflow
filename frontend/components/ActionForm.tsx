@@ -7,6 +7,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { SkillPicker } from "@/components/SkillPicker";
+import type { Skill } from "@/lib/types";
 import type { PendingActionFormField, PendingActionState } from "@/lib/useAgenticSearchStream";
 
 /**
@@ -123,6 +125,26 @@ function StageListEditor({ value, onChange }: { value: string; onChange: (json: 
   );
 }
 
+function SkillPickerField({ value, onChange }: { value: string; onChange: (json: string) => void }) {
+  const selectedSkillIds = useMemo(() => {
+    try {
+      const parsed = JSON.parse(value || "[]");
+      return new Set<string>(Array.isArray(parsed) ? parsed : []);
+    } catch {
+      return new Set<string>();
+    }
+  }, [value]);
+
+  function toggle(skill: Skill) {
+    const next = new Set(selectedSkillIds);
+    if (next.has(skill.id)) next.delete(skill.id);
+    else next.add(skill.id);
+    onChange(JSON.stringify(Array.from(next)));
+  }
+
+  return <SkillPicker selectedSkillIds={selectedSkillIds} onToggle={toggle} />;
+}
+
 function FieldInput({
   field,
   value,
@@ -134,6 +156,9 @@ function FieldInput({
 }) {
   if (field.type === "stageList") {
     return <StageListEditor value={String(value ?? "")} onChange={onChange} />;
+  }
+  if (field.type === "skillPicker") {
+    return <SkillPickerField value={String(value ?? "[]")} onChange={onChange} />;
   }
   if (field.type === "select") {
     return (
